@@ -135,15 +135,59 @@ IGNORE_FILENAME = ".veriflow-security-ignore"
 # Redaction
 # --------------------------------------------------------------------------- #
 
-#: Substrings that mark a match as a placeholder rather than a live credential.
-#: Reporting these as leaked secrets trains users to ignore the scanner.
-_PLACEHOLDER_TOKENS: Tuple[str, ...] = (
-    "redacted", "example", "changeme", "change_me", "placeholder", "dummy",
-    "your-", "your_", "yourkey", "yourtoken", "xxxx", "aaaa", "0000",
-    "notreal", "fake", "sample", "test-key", "testkey", "insert", "todo",
-    "<your", "<insert", "<token", "<secret", "<password", "replace-me",
-    "s3cr3t-placeholder", "abcdef", "123456", "deadbeef", "foobar",
+#: Unambiguous placeholders. These are the only substrings that justify
+#: dropping a match outright: each is a value no real credential would contain,
+#: so there is nothing for a reviewer to confirm.
+_OBVIOUS_PLACEHOLDER_TOKENS: Tuple[str, ...] = (
+    "redacted", "changeme", "change_me", "placeholder", "replace-me",
+    "replace_me", "your-", "your_", "yourkey", "yourtoken",
+    "<your", "<insert", "<token", "<secret", "<password", "<api",
+    "xxxx", "aaaa", "0000", "insert", "todo", "s3cr3t-placeholder",
 )
+
+#: Words that *suggest* a value is synthetic but do not prove it. A real
+#: credential committed to a file named `test_settings.py`, or named
+#: `EXAMPLE_API_KEY`, contains one of these and is still a real credential.
+#: Dropping on these words alone is how live keys get missed, so a match here
+#: is downgraded to LOW confidence rather than discarded -- and only when no
+#: stronger signal (entropy, known prefix) contradicts it.
+#:
+#: Matched as whole delimiter-separated segments, so `sk_live_example_1` and
+#: `test-key` match while `latest` and `attestation` do not.
+_SOFT_PLACEHOLDER_WORDS: frozenset = frozenset(
+    {
+        "test", "tests", "testing", "example", "examples", "dummy", "fake",
+        "sample", "samples", "mock", "stub", "demo", "notreal", "foobar",
+        "abcdef", "deadbeef", "123456", "placeholder",
+    }
+)
+
+#: Distinctive enough that a bare substring match carries no false-positive
+#: risk, which catches run-together spellings like `examplekey` or `dummydata`.
+_SOFT_PLACEHOLDER_SUBSTRINGS: Tuple[str, ...] = (
+    "example", "dummy", "notreal", "foobar", "deadbeef", "testkey",
+)
+
+#: Provider-issued key prefixes. These are assigned by the issuing service, so
+#: a value carrying one is a real key shape regardless of surrounding wording.
+#: A prefix match always outranks a soft placeholder word.
+_KNOWN_KEY_PREFIXES: Tuple[str, ...] = (
+    "sk_live_", "sk_test_", "pk_live_", "rk_live_", "AKIA", "ASIA",
+    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+    "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xapp-",
+    "AIza", "ya29.", "SG.", "glpat-", "dop_v1_", "shpat_", "npm_",
+    "sq0atp-", "sq0csp-", "EAACEdEose0cBA", "hf_", "sk-ant-", "sk-proj-",
+)
+
+#: Entropy at or above this threshold means the value's character
+#: distribution looks generated rather than written, which is what separates
+#: `EXAMPLE_KEY = "aB3xK9mQ7pL2wZ8n"` from `EXAMPLE_KEY = "example_value"`.
+_HIGH_ENTROPY_BITS = 3.5
+
+#: Verdicts returned by :func:`classify_secret_value`.
+VERDICT_DROP = "drop"
+VERDICT_LOW = "low"
+VERDICT_REPORT = "report"
 
 #: Indicators that the value is read from configuration rather than hard-coded.
 _INDIRECTION_TOKENS: Tuple[str, ...] = (
@@ -201,26 +245,86 @@ def redact_line(line: str, matched_values: Sequence[str]) -> str:
     return redacted.strip()
 
 
-def _is_placeholder(value: str) -> bool:
-    """Return True when a matched value is a documented placeholder, not a secret."""
+def _contains_soft_placeholder(lowered: str) -> bool:
+    """Return True when the value carries a word suggesting it is synthetic.
+
+    Segment-aware on purpose: splitting on non-alphanumerics means `test` matches
+    in `sk_live_test_1` and `test-key`, but `latest` and `attestation` stay clear,
+    which a bare substring check would wrongly flag.
+    """
+    segments = set(re.split(r"[^a-z0-9]+", lowered))
+    if segments & _SOFT_PLACEHOLDER_WORDS:
+        return True
+    return any(token in lowered for token in _SOFT_PLACEHOLDER_SUBSTRINGS)
+
+
+def _has_known_key_prefix(candidate: str) -> bool:
+    """Return True when the value starts with a provider-issued key prefix.
+
+    Case-sensitive on purpose: ``AKIA`` and ``sk_live_`` are issued with a
+    fixed case, and lowercasing would match prose like "akia" in a comment.
+    """
+    return any(candidate.startswith(prefix) for prefix in _KNOWN_KEY_PREFIXES)
+
+
+def classify_secret_value(value: str) -> Tuple[str, str]:
+    """Classify a matched credential as drop / LOW-confidence / report.
+
+    Returns ``(verdict, reason)`` where verdict is one of
+    :data:`VERDICT_DROP`, :data:`VERDICT_LOW` or :data:`VERDICT_REPORT`, and
+    reason explains the decision for the report's skipped section.
+
+    The distinction that matters: a value is discarded only when it cannot
+    possibly be a credential (an obvious placeholder, an environment lookup, a
+    regex source). Merely *looking* synthetic -- living in a file called
+    ``test_config.py``, or named ``EXAMPLE_TOKEN`` -- is not enough, because
+    real keys get committed under exactly those names. Those are reported at
+    LOW confidence so a reviewer sees them and decides, which is the whole
+    point: a silent drop is indistinguishable from a scanner that missed it.
+    """
     candidate = value.strip().strip("'\"`")
-    if len(candidate) < 8:
-        return True
-    lowered = candidate.lower()
-    if any(token in lowered for token in _PLACEHOLDER_TOKENS):
-        return True
+
+    if not candidate:
+        return VERDICT_DROP, "empty value"
     if any(token in value for token in _INDIRECTION_TOKENS):
-        return True
-    # A value made of a single repeated character carries no secret.
-    if len(set(lowered)) <= 2:
-        return True
-    # Regex sources and format templates match credential shapes but are code.
+        return VERDICT_DROP, "value is read from configuration or the environment, not hard-coded"
     if any(meta in candidate for meta in ("[A-Za-z", "\\d", "\\w", "(?:", ".*", "+=*")):
-        return True
+        return VERDICT_DROP, "value is a regex source or format template, not a literal"
+
+    lowered = candidate.lower()
+    has_prefix = _has_known_key_prefix(candidate)
+    entropy = _shannon_entropy(candidate)
+
+    # A provider-issued prefix is decisive: report it whatever the wording
+    # around it says. `sk_live_` in a file named example.py is still a live key.
+    if has_prefix:
+        if _contains_soft_placeholder(lowered):
+            return (
+                VERDICT_LOW,
+                "contains a placeholder-looking word but carries a known provider key prefix",
+            )
+        return VERDICT_REPORT, ""
+
+    if len(candidate) < 8:
+        return VERDICT_DROP, "value is shorter than 8 characters"
+    if len(set(lowered)) <= 2:
+        return VERDICT_DROP, "value is a single repeated character"
+    if any(token in lowered for token in _OBVIOUS_PLACEHOLDER_TOKENS):
+        return VERDICT_DROP, "value is an unambiguous placeholder"
+
+    if _contains_soft_placeholder(lowered):
+        if entropy >= _HIGH_ENTROPY_BITS:
+            return (
+                VERDICT_LOW,
+                f"contains a placeholder-looking word but has high entropy ({entropy:.2f} bits/char)",
+            )
+        return VERDICT_DROP, "value is a low-entropy placeholder"
+
     # Low-entropy English-looking values are identifiers, not credentials.
-    if _shannon_entropy(candidate) < 2.6:
-        return True
-    return False
+    if entropy < 2.6:
+        return VERDICT_DROP, f"value has low entropy ({entropy:.2f} bits/char), reads as an identifier"
+
+    return VERDICT_REPORT, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -889,6 +993,11 @@ class SecurityFinding:
     false_positives: str
     catalog_ids: List[str] = field(default_factory=list)
     references: List[str] = field(default_factory=list)
+    #: True only when the placeholder classifier downgraded this finding from
+    #: its rule's confidence. Several rules are natively LOW, so counting
+    #: `confidence == "LOW"` would report those as downgrades and make the
+    #: skipped section state something untrue.
+    confidence_downgraded: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -920,6 +1029,30 @@ class ScanReport:
     exclusion_patterns: List[str] = field(default_factory=list)
     rules_applied: List[str] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
+    #: Candidate secrets discarded as placeholders, each with the reason.
+    #: Disclosed in the report so a drop is never indistinguishable from a miss.
+    dropped_placeholders: List[Dict[str, Any]] = field(default_factory=list)
+    #: Set when the scan was restricted to specific paths (``--changed``).
+    included_paths: List[str] = field(default_factory=list)
+    #: Files present in the tree but outside a restricted scan's scope.
+    files_outside_scope: int = 0
+
+    def dropped_reason_counts(self) -> Dict[str, int]:
+        """Group discarded candidates by reason, for the skipped section."""
+        counts: Dict[str, int] = {}
+        for item in self.dropped_placeholders:
+            reason = str(item.get("reason", "unspecified"))
+            counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
+    def low_confidence_count(self) -> int:
+        """Findings the placeholder classifier downgraded.
+
+        Deliberately not `confidence == "LOW"`: SEC-PATH-001 and SEC-REDIR-001
+        are LOW by rule definition, and counting them here would claim they
+        were rescued from a placeholder drop when they never were.
+        """
+        return sum(1 for f in self.findings if f.confidence_downgraded)
 
     def severity_counts(self) -> Dict[str, int]:
         counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
@@ -941,6 +1074,11 @@ class ScanReport:
             "severity_counts": self.severity_counts(),
             "findings": [f.to_dict() for f in self.findings],
             "limitations": list(self.limitations),
+            "low_confidence_findings": self.low_confidence_count(),
+            "dropped_placeholders": list(self.dropped_placeholders),
+            "dropped_placeholder_reasons": self.dropped_reason_counts(),
+            "included_paths": list(self.included_paths),
+            "files_outside_scope": self.files_outside_scope,
         }
 
 
@@ -1052,26 +1190,30 @@ def scan_file(
     path: Path,
     root: Path,
     rules: Sequence[SecurityRule] = SECURITY_RULES,
-) -> Tuple[List[SecurityFinding], int]:
+) -> Tuple[List[SecurityFinding], int, List[Dict[str, Any]]]:
     """Scan a single file.
 
     Returns:
-        ``(findings, suppressed_count)``. Secret values are redacted before they
-        are placed in any finding, so the return value is always safe to print.
+        ``(findings, suppressed_count, dropped)``. Secret values are redacted
+        before they are placed in any finding, so the return value is always
+        safe to print. ``dropped`` records each candidate discarded as a
+        placeholder, with the reason, so the report can disclose it instead of
+        the scan silently shrinking.
     """
     findings: List[SecurityFinding] = []
     suppressed = 0
+    dropped: List[Dict[str, Any]] = []
 
     applicable = _applicable_rules(path, rules)
     if not applicable:
-        return findings, suppressed
+        return findings, suppressed, dropped
 
     try:
         if path.stat().st_size > MAX_FILE_BYTES:
-            return findings, suppressed
+            return findings, suppressed, dropped
         text = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, PermissionError):
-        return findings, suppressed
+        return findings, suppressed, dropped
 
     try:
         relative = str(path.relative_to(root))
@@ -1120,34 +1262,54 @@ def scan_file(
                 continue
 
             raw_value = ""
+            confidence = rule.confidence
+            downgrade_reason = ""
             if rule.redact_match:
                 raw_value = _matched_value(match, rule)
-                if _is_placeholder(raw_value):
+                verdict, reason = classify_secret_value(raw_value)
+                if verdict == VERDICT_DROP:
+                    dropped.append(
+                        {
+                            "rule_id": rule.rule_id,
+                            "file": relative,
+                            "line": index,
+                            "reason": reason,
+                        }
+                    )
                     continue
+                if verdict == VERDICT_LOW:
+                    confidence = "LOW"
+                    downgrade_reason = reason
 
             if line_has_suppression:
                 suppressed += 1
                 continue
 
             evidence = redact_line(line, [raw_value]) if raw_value else _bounded(line)
+            false_positives = rule.false_positives
+            if downgrade_reason:
+                false_positives = (
+                    f"Reported at LOW confidence: {downgrade_reason}. {rule.false_positives}"
+                )
             findings.append(
                 SecurityFinding(
                     rule_id=rule.rule_id,
                     title=rule.title,
                     category=rule.category,
                     severity=rule.severity,
-                    confidence=rule.confidence,
+                    confidence=confidence,
                     file=relative,
                     line=index,
                     evidence=evidence,
                     remediation=rule.remediation,
-                    false_positives=rule.false_positives,
+                    false_positives=false_positives,
                     catalog_ids=list(rule.catalog_ids),
                     references=list(rule.references),
+                    confidence_downgraded=bool(downgrade_reason),
                 )
             )
 
-    return findings, suppressed
+    return findings, suppressed, dropped
 
 
 def _matched_value(match: re.Match, rule: SecurityRule) -> str:
@@ -1210,6 +1372,7 @@ def scan_project(
     exclude_paths: Optional[Sequence[str]] = None,
     use_ignore_file: bool = True,
     max_files: int = 20_000,
+    include_paths: Optional[Sequence[str]] = None,
 ) -> ScanReport:
     """Run the static security scan over a project tree.
 
@@ -1223,6 +1386,11 @@ def scan_project(
             ``.veriflow-security-ignore`` file when present.
         max_files: Upper bound on files inspected, so a scan cannot run away on
             an unexpectedly large tree.
+        include_paths: Restrict the scan to exactly these relative paths. Used
+            by ``--changed``. An empty sequence is treated as "no restriction"
+            rather than "scan nothing", because scanning zero files would
+            otherwise produce a clean report that looks identical to a scan
+            that found no problems.
 
     Returns:
         A :class:`ScanReport` whose findings are already redacted.
@@ -1268,6 +1436,11 @@ def scan_project(
         exclusion_patterns=patterns,
     )
 
+    include_set: Optional[Set[str]] = None
+    if include_paths:
+        include_set = {str(p).replace("\\", "/") for p in include_paths}
+        report.included_paths = sorted(include_set)
+
     for path in iter_scannable_files(root_path, excluded_dirs=excluded_dirs):
         if report.files_scanned >= max_files:
             report.limitations.append(
@@ -1278,13 +1451,17 @@ def scan_project(
             relative = str(path.relative_to(root_path))
         except ValueError:
             relative = str(path)
+        if include_set is not None and relative.replace("\\", "/") not in include_set:
+            report.files_outside_scope += 1
+            continue
         if _is_excluded(relative, patterns):
             report.excluded_files += 1
             continue
-        findings, suppressed = scan_file(path, root_path, selected)
+        findings, suppressed, dropped = scan_file(path, root_path, selected)
         report.files_scanned += 1
         report.suppressed += suppressed
         report.findings.extend(findings)
+        report.dropped_placeholders.extend(dropped)
 
     report.findings.sort(
         key=lambda f: (
@@ -1323,6 +1500,62 @@ def scan_project(
 # --------------------------------------------------------------------------- #
 
 
+def format_skipped_section(report: ScanReport) -> List[str]:
+    """Render the 'Suppressed / skipped' block for a scan report.
+
+    Always rendered, even when nothing was skipped. An empty section states
+    that explicitly, because the absence of a section reads as "nothing was
+    hidden" whether or not that is true, and the whole point of this block is
+    that a reader never has to assume.
+    """
+    lines = ["Suppressed / skipped:"]
+    anything = False
+
+    if report.excluded_files:
+        anything = True
+        patterns = ", ".join(report.exclusion_patterns) or "(none recorded)"
+        lines.append(
+            f"  - {report.excluded_files} file(s) excluded by ignore pattern(s): {patterns}"
+        )
+    if report.suppressed:
+        anything = True
+        lines.append(
+            f"  - {report.suppressed} finding(s) silenced by an inline "
+            f"'{SUPPRESSION_MARKER}' marker"
+        )
+    if report.files_skipped:
+        anything = True
+        lines.append(f"  - {report.files_skipped} file(s) skipped as unreadable or oversized")
+
+    if report.included_paths:
+        anything = True
+        lines.append(
+            f"  - scan restricted to {len(report.included_paths)} path(s); "
+            f"{report.files_outside_scope} file(s) in the tree were outside that scope "
+            "and were NOT scanned"
+        )
+
+    dropped = report.dropped_reason_counts()
+    if dropped:
+        anything = True
+        total = sum(dropped.values())
+        lines.append(f"  - {total} candidate value(s) discarded as placeholders:")
+        for reason, count in sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"      {count} x {reason}")
+
+    low = report.low_confidence_count()
+    if low:
+        anything = True
+        lines.append(
+            f"  - {low} finding(s) reported at LOW confidence rather than discarded "
+            "(placeholder-looking, but high entropy or a known key prefix)"
+        )
+
+    if not anything:
+        lines.append("  Nothing was skipped, excluded, suppressed or downgraded.")
+    return lines
+
+
 def format_scan_report(report: ScanReport) -> str:
     """Render a scan report as readable text. Output contains no raw secrets."""
     counts = report.severity_counts()
@@ -1356,6 +1589,8 @@ def format_scan_report(report: ScanReport) -> str:
                 lines.append(f"  Catalog:     {', '.join(finding.catalog_ids)}")
             lines.append("")
 
+    lines.append("-" * 60)
+    lines.extend(format_skipped_section(report))
     lines.append("-" * 60)
     lines.append("Limitations:")
     for limitation in report.limitations:
