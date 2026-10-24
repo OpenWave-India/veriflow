@@ -57,6 +57,17 @@ class TestMarketplaceManifest(unittest.TestCase):
         """source must be "./" — the repo IS the plugin, same as other single-plugin repos."""
         self.assertEqual(self.manifest["plugins"][0]["source"], "./")
 
+    def test_plugin_has_strict_false(self):
+        """strict:false is required because the plugin layout doesn't match strict expectations.
+        Without it, Claude Code refuses to install even when the manifest and plugin.json are valid."""
+        self.assertIs(self.manifest["plugins"][0].get("strict"), False)
+
+    def test_plugin_skills_field_points_at_skill_directory(self):
+        """skills field must explicitly list the skill path — Claude Code does not reliably
+        auto-discover skills/ from the repo root without it."""
+        skills = self.manifest["plugins"][0].get("skills", [])
+        self.assertIn("skills/veriflow", skills)
+
     def test_plugin_json_exists_alongside_marketplace_json(self):
         """plugin.json is required by strict mode (the default).
         Without it, Claude Code can't install the plugin even if the marketplace loads."""
@@ -64,7 +75,7 @@ class TestMarketplaceManifest(unittest.TestCase):
         self.assertTrue(plugin_json.is_file(), ".claude-plugin/plugin.json is missing")
 
     def test_skills_directory_exists_at_repo_root(self):
-        """Claude Code auto-discovers skills/ at the plugin root (the repo root for source "./")."""
+        """Claude Code resolves the skills field path relative to the plugin root."""
         skills_dir = REPO_ROOT / "skills" / "veriflow"
         self.assertTrue(skills_dir.is_dir())
         self.assertTrue((skills_dir / "SKILL.md").is_file())
