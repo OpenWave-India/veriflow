@@ -51,7 +51,10 @@ class TestRunChecksDiscovery(unittest.TestCase):
         self.assertIn("typecheck", check_names)
 
         test_check = next(c for c in res["discovered_checks"] if c["name"] == "test")
-        self.assertEqual(test_check["command"], ["pytest"])
+        # No project venv here, so pytest runs under the interpreter running
+        # Veriflow -- never a bare "pytest", which would resolve to whatever
+        # launcher PATH happens to find first.
+        self.assertEqual(test_check["command"], [sys.executable, "-m", "pytest"])
         self.assertEqual(test_check["ecosystem"], "python")
         self.assertFalse(test_check["executed"])
         self.assertEqual(test_check["status"], "proposed")
@@ -208,7 +211,9 @@ class TestRunChecksDiscovery(unittest.TestCase):
 
         res = discover_checks(spaced_dir)
         self.assertEqual(res["project_root"], str(spaced_dir.resolve()))
-        self.assertEqual(res["discovered_checks"][0]["command"], ["pytest"])
+        self.assertEqual(
+            res["discovered_checks"][0]["command"], [sys.executable, "-m", "pytest"]
+        )
 
         # CLI subprocess with space in argument
         proc = subprocess.run(
@@ -219,7 +224,9 @@ class TestRunChecksDiscovery(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         parsed = json.loads(proc.stdout)
         self.assertEqual(parsed["project_root"], str(spaced_dir.resolve()))
-        self.assertEqual(parsed["discovered_checks"][0]["command"], ["pytest"])
+        self.assertEqual(
+            parsed["discovered_checks"][0]["command"], [sys.executable, "-m", "pytest"]
+        )
 
     def test_11_cli_help_and_exit_behavior(self):
         # --help flag
@@ -348,7 +355,14 @@ class TestRunChecksExecution(unittest.TestCase):
         # weaken the guarantee this test exists to protect.
         self.assertTrue(preview["discovered_checks"])
         for check in preview["discovered_checks"]:
-            self.assertEqual(check["status"], "proposed")
+            # The guarantee is that nothing RAN. Status may be "proposed",
+            # "proposed_optional" (installed but unconfigured, or network-bound)
+            # or "BLOCKED" (tool absent) -- none of which are executed, and none
+            # of which can read as a pass.
+            self.assertIn(
+                check["status"],
+                ("proposed", run_checks_module.STATUS_OPTIONAL, "BLOCKED"),
+            )
             self.assertFalse(check["executed"])
         self.assertEqual(preview["summary"]["passed"], 0)
         self.assertEqual(preview["summary"]["total"], len(preview["discovered_checks"]))
@@ -1161,3 +1175,316 @@ class TestOutputRedaction(unittest.TestCase):
         redacted = run_checks_module._truncate_output(text)
         self.assertNotIn(secret, redacted)
         self.assertNotIn(secret[:10], redacted)
+
+
+class TestPytestInterpreterResolution(unittest.TestCase):
+    """pytest is always invoked as `<interpreter> -m pytest`.
+
+    A bare `pytest` runs whichever launcher PATH resolves first, which can
+    import a different site-packages than the project's. Tests then pass or
+    fail for reasons unrelated to the code under test, and the report gives no
+    hint that happened.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.root = Path(self.test_dir)
+        (self.root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _mock_venv(self) -> Path:
+        scripts = self.root / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+        scripts.mkdir(parents=True)
+        py = scripts / ("python.exe" if sys.platform == "win32" else "python")
+        py.write_text("# mock interpreter\n", encoding="utf-8")
+        (self.root / ".venv" / "pyvenv.cfg").write_text(
+            "home = /usr\nversion = 3.11.9\n", encoding="utf-8"
+        )
+        return py
+
+    def _test_check(self, result) -> dict:
+        return next(c for c in result["discovered_checks"] if c["name"] == "test")
+
+    def test_project_venv_interpreter_is_preferred(self):
+        py = self._mock_venv()
+        check = self._test_check(discover_checks(self.root))
+        self.assertEqual(check["command"], [str(py.resolve()), "-m", "pytest"])
+        self.assertEqual(check["resolution_source"], "project_venv")
+
+    def test_falls_back_to_the_veriflow_interpreter(self):
+        check = self._test_check(discover_checks(self.root))
+        self.assertEqual(check["command"], [sys.executable, "-m", "pytest"])
+        self.assertEqual(check["resolution_source"], "veriflow_interpreter")
+
+    def test_command_is_never_a_bare_pytest(self):
+        for use_venv in (True, False):
+            with self.subTest(venv=use_venv):
+                shutil.rmtree(self.root / ".venv", ignore_errors=True)
+                if use_venv:
+                    self._mock_venv()
+                check = self._test_check(discover_checks(self.root))
+                self.assertEqual(check["command"][1:], ["-m", "pytest"])
+                self.assertNotEqual(check["command"], ["pytest"])
+
+    def test_mismatched_path_pytest_emits_a_warning_naming_both(self):
+        """The warning must name both interpreters, not just say 'mismatch'."""
+        fake_bin = self.root / "otherpy" / ("Scripts" if sys.platform == "win32" else "bin")
+        fake_bin.mkdir(parents=True)
+        fake_pytest = fake_bin / ("pytest.exe" if sys.platform == "win32" else "pytest")
+        fake_pytest.write_text("# mock\n", encoding="utf-8")
+        fake_py = fake_bin / ("python.exe" if sys.platform == "win32" else "python")
+        fake_py.write_text("# mock\n", encoding="utf-8")
+        (self.root / "otherpy" / "pyvenv.cfg").write_text(
+            "version = 3.8.1\n", encoding="utf-8"
+        )
+
+        with unittest.mock.patch.object(
+            run_checks_module.shutil, "which", return_value=str(fake_pytest)
+        ):
+            result = discover_checks(self.root)
+
+        warnings = [l for l in result["limitations"] if l.startswith("WARNING")]
+        self.assertTrue(warnings, "no WARNING emitted for a mismatched PATH pytest")
+        joined = " ".join(warnings)
+        self.assertIn(str(fake_pytest), joined)
+        self.assertIn("3.8.1", joined)
+        self.assertIn(sys.executable, joined)
+
+    def test_no_warning_when_path_pytest_matches(self):
+        bin_dir = Path(sys.executable).parent
+        fake_pytest = bin_dir / ("pytest.exe" if sys.platform == "win32" else "pytest")
+        with unittest.mock.patch.object(
+            run_checks_module.shutil, "which", return_value=str(fake_pytest)
+        ):
+            result = discover_checks(self.root)
+        self.assertEqual([l for l in result["limitations"] if l.startswith("WARNING")], [])
+
+    def test_missing_pytest_is_a_limitation_not_a_pass(self):
+        self._mock_venv()
+        result = discover_checks(self.root)
+        self.assertTrue(
+            any("not installed" in l and "COMMAND_NOT_FOUND" in l for l in result["limitations"]),
+            f"absent pytest not disclosed: {result['limitations']}",
+        )
+
+
+class TestInterpreterVersionDetection(unittest.TestCase):
+    """Version is read off the filesystem; discovery never executes a binary."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.root = Path(self.test_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_reads_version_from_pyvenv_cfg(self):
+        scripts = self.root / "bin"
+        scripts.mkdir()
+        (self.root / "pyvenv.cfg").write_text("version = 3.12.4\n", encoding="utf-8")
+        self.assertEqual(
+            run_checks_module._interpreter_version(scripts / "python"), "3.12.4"
+        )
+
+    def test_reads_version_from_a_system_install_layout(self):
+        """python.exe sits beside pythonXY.dll in the install root, with no
+        pyvenv.cfg. Searching only the parent directory reports "unknown" and
+        silently weakens the mismatch warning."""
+        install = self.root / "Python39"
+        install.mkdir()
+        (install / "python.exe").write_text("#\n", encoding="utf-8")
+        (install / "python39.dll").write_text("#\n", encoding="utf-8")
+        self.assertEqual(
+            run_checks_module._interpreter_version(install / "python.exe"), "3.9"
+        )
+
+    def test_finds_interpreter_one_level_above_a_scripts_dir(self):
+        """A system install keeps pytest.exe in Scripts/ and python.exe above it."""
+        install = self.root / "Python39"
+        scripts = install / "Scripts"
+        scripts.mkdir(parents=True)
+        (install / "python.exe").write_text("#\n", encoding="utf-8")
+        pytest_exe = scripts / "pytest.exe"
+        pytest_exe.write_text("#\n", encoding="utf-8")
+        found = run_checks_module._interpreter_behind_script(pytest_exe)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.name, "python.exe")
+
+    def test_unknown_version_is_reported_not_guessed(self):
+        self.assertIsNone(
+            run_checks_module._interpreter_version(self.root / "nowhere" / "python")
+        )
+        described = run_checks_module._describe_interpreter(self.root / "nowhere" / "python")
+        self.assertIn("version unknown", described)
+
+    def test_real_interpreter_is_describable(self):
+        self.assertIn(str(Path(sys.executable)), run_checks_module._describe_interpreter(sys.executable))
+
+
+class TestDefaultConfigOptionalChecks(unittest.TestCase):
+    """An installed-but-unconfigured tool is offered, not silently skipped.
+
+    Skipping it loses coverage the user already paid for by installing the
+    tool. Proposing it unlabelled would be worse: a linter run under defaults
+    it was never tuned for reports issues the project may have deliberately
+    configured away. So it is proposed, marked optional, and labelled
+    "default config".
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.root = Path(self.test_dir)
+        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _fake_tool(self, name: str) -> Path:
+        """Create a project venv containing `name`, so resolution finds it."""
+        scripts = self.root / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+        scripts.mkdir(parents=True, exist_ok=True)
+        py = scripts / ("python.exe" if sys.platform == "win32" else "python")
+        if not py.exists():
+            py.write_text("# mock\n", encoding="utf-8")
+        tool = scripts / (f"{name}.exe" if sys.platform == "win32" else name)
+        tool.write_text("# mock\n", encoding="utf-8")
+        return tool
+
+    def _check(self, result, name):
+        return next((c for c in result["discovered_checks"] if c["name"] == name), None)
+
+    def test_installed_unconfigured_ruff_is_proposed_as_optional(self):
+        self._fake_tool("ruff")
+        lint = self._check(discover_checks(self.root), "lint")
+        self.assertIsNotNone(lint, "installed ruff was skipped instead of proposed")
+        self.assertEqual(lint["status"], run_checks_module.STATUS_OPTIONAL)
+        self.assertEqual(lint["config_source"], "default config")
+        self.assertTrue(lint["optional"])
+
+    def test_installed_unconfigured_mypy_is_proposed_as_optional(self):
+        self._fake_tool("mypy")
+        tc = self._check(discover_checks(self.root), "typecheck")
+        self.assertIsNotNone(tc, "installed mypy was skipped instead of proposed")
+        self.assertEqual(tc["status"], run_checks_module.STATUS_OPTIONAL)
+        self.assertEqual(tc["config_source"], "default config")
+
+    def test_optional_status_is_distinct_from_proposed(self):
+        """A caller must be able to tell a project's own check from an offer."""
+        self._fake_tool("ruff")
+        self.assertNotEqual(run_checks_module.STATUS_OPTIONAL, "proposed")
+        lint = self._check(discover_checks(self.root), "lint")
+        self.assertNotEqual(lint["status"], "proposed")
+
+    def test_default_config_tradeoff_is_stated_in_the_reason(self):
+        self._fake_tool("ruff")
+        lint = self._check(discover_checks(self.root), "lint")
+        self.assertIn("default config", lint["reason"])
+        self.assertIn("installed", lint["reason"])
+
+    def test_the_offer_is_disclosed_as_a_limitation(self):
+        self._fake_tool("ruff")
+        result = discover_checks(self.root)
+        self.assertTrue(
+            any("optional" in l and "ruff" in l.lower() for l in result["limitations"]),
+            f"optional offer not disclosed: {result['limitations']}",
+        )
+
+    def test_not_installed_and_unconfigured_proposes_nothing(self):
+        """No tool, no offer -- and the report says so rather than staying quiet."""
+        with unittest.mock.patch.object(run_checks_module.shutil, "which", return_value=None):
+            result = discover_checks(self.root)
+        self.assertIsNone(self._check(result, "lint"))
+        self.assertTrue(
+            any("not installed" in l for l in result["limitations"]),
+            f"missing tool not disclosed: {result['limitations']}",
+        )
+
+    def test_configured_tool_keeps_normal_proposed_status(self):
+        """Feature 4 must not relabel a project's own configured checks."""
+        (self.root / "ruff.toml").write_text("line-length = 100\n", encoding="utf-8")
+        self._fake_tool("ruff")
+        lint = self._check(discover_checks(self.root), "lint")
+        self.assertEqual(lint["status"], "proposed")
+        self.assertNotIn("config_source", lint)
+
+
+class TestDependencyAudit(unittest.TestCase):
+    """Dependency auditing is delegated, offered, and never silently absent.
+
+    Veriflow bundles no CVE data. The failure mode to prevent is a clean report
+    that implies dependencies were checked when no advisory database was ever
+    consulted -- so a missing tool is BLOCKED with its install command, and the
+    limitation says vulnerabilities are UNKNOWN rather than absent.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.root = Path(self.test_dir)
+        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+        (self.root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _audit(self, result):
+        return next(
+            (c for c in result["discovered_checks"] if c["name"] == "dependency-audit"), None
+        )
+
+    def test_missing_pip_audit_is_blocked_with_install_command(self):
+        with unittest.mock.patch.object(run_checks_module.shutil, "which", return_value=None):
+            audit = self._audit(discover_checks(self.root))
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit["status"], "BLOCKED")
+        self.assertEqual(audit["remediation"], "pip install pip-audit")
+
+    def test_blocked_audit_is_never_a_pass_even_under_execute(self):
+        with unittest.mock.patch.object(run_checks_module.shutil, "which", return_value=None):
+            result = discover_checks(self.root, execute=True)
+        audit = self._audit(result)
+        self.assertEqual(audit["status"], "BLOCKED")
+        self.assertFalse(audit["executed"])
+        self.assertGreaterEqual(result["summary"]["blocked"], 1)
+
+    def test_blocked_audit_states_unknown_not_absent(self):
+        with unittest.mock.patch.object(run_checks_module.shutil, "which", return_value=None):
+            result = discover_checks(self.root)
+        self.assertTrue(
+            any("UNKNOWN, not absent" in l for l in result["limitations"]),
+            f"BLOCKED audit implied absence of vulnerabilities: {result['limitations']}",
+        )
+
+    def test_nothing_is_installed_automatically(self):
+        """The remediation is text for the user to run, never a command Veriflow runs."""
+        with unittest.mock.patch.object(run_checks_module.shutil, "which", return_value=None):
+            audit = self._audit(discover_checks(self.root))
+        self.assertNotIn("install", " ".join(audit["command"]).lower())
+
+    def test_available_pip_audit_is_optional_and_network_bound(self):
+        scripts = self.root / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+        scripts.mkdir(parents=True)
+        (scripts / ("python.exe" if sys.platform == "win32" else "python")).write_text("#\n")
+        (scripts / ("pip-audit.exe" if sys.platform == "win32" else "pip-audit")).write_text("#\n")
+        audit = self._audit(discover_checks(self.root))
+        self.assertEqual(audit["status"], run_checks_module.STATUS_OPTIONAL)
+        self.assertTrue(audit["optional"])
+        self.assertTrue(audit["requires_network"])
+
+    def test_optional_audit_is_not_run_by_a_bare_execute(self):
+        """It reaches the network. A plain --execute must not trigger that."""
+        scripts = self.root / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+        scripts.mkdir(parents=True)
+        (scripts / ("python.exe" if sys.platform == "win32" else "python")).write_text("#\n")
+        (scripts / ("pip-audit.exe" if sys.platform == "win32" else "pip-audit")).write_text("#\n")
+        audit = self._audit(discover_checks(self.root, execute=True))
+        self.assertEqual(audit["status"], "NOT_RUN")
+        self.assertIn("--check dependency-audit", audit["skip_reason"])
+
+    def test_malformed_package_json_offers_no_npm_audit(self):
+        (self.root / "package.json").write_text("{ broken", encoding="utf-8")
+        result = discover_checks(self.root)
+        js = [c for c in result["discovered_checks"] if c["ecosystem"] == "javascript"]
+        self.assertEqual(js, [])
+        self.assertTrue(any("could not be parsed" in l for l in result["limitations"]))
