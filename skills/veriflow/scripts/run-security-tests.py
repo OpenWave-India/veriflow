@@ -67,6 +67,24 @@ except ImportError:  # pragma: no cover - direct execution outside the repo
     )
 
 
+def _load_changed_files():
+    """Load the shared changed-files helper, or None when unavailable.
+
+    Imported lazily and defensively: --changed is an optimisation, and a
+    missing helper must widen the scan rather than fail the run.
+    """
+    try:
+        from skills.veriflow.scripts import changed_files as mod  # type: ignore
+        return mod
+    except ImportError:
+        pass
+    try:
+        import changed_files as mod  # type: ignore
+        return mod
+    except ImportError:
+        return None
+
+
 def _build_target(args: argparse.Namespace) -> SecurityTarget:
     """Translate CLI arguments into a validated live-check target."""
     user_a: Optional[Dict[str, str]] = None
@@ -168,6 +186,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Ignore the project's .veriflow-security-ignore file.",
     )
+    static_group.add_argument(
+        "--changed",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="BASE",
+        help=(
+            "Limit the scan to files changed according to git. With BASE, compares "
+            "against that revision; without it, uses staged, unstaged and untracked "
+            "changes. Falls back to a full scan, with the reason stated in the report, "
+            "when git cannot answer."
+        ),
+    )
 
     live_group = parser.add_argument_group("live checks")
     live_group.add_argument("--url", help="Base URL of a running service, e.g. http://127.0.0.1:8099")
@@ -213,6 +244,31 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---------------- static scan ---------------- #
     if not args.no_static:
+        include_paths = None
+        change_info = None
+        if args.changed is not None:
+            change_mod = _load_changed_files()
+            if change_mod is None:
+                change_info = {
+                    "narrowed": False,
+                    "fallback_reason": "the changed-files helper could not be loaded",
+                }
+            else:
+                change_set = change_mod.resolve_changed_files(
+                    args.root, args.changed or None, source_only=False
+                )
+                change_info = change_set.to_dict()
+                if change_set.narrowed and change_set.files:
+                    include_paths = change_set.files
+                elif change_set.narrowed:
+                    # Narrowing succeeded but matched nothing. Scanning zero
+                    # files would print a clean report, so widen instead.
+                    change_info["fallback_reason"] = (
+                        "no changed files were found, so the full tree was scanned "
+                        "rather than reporting a clean scan over nothing"
+                    )
+                    change_info["narrowed"] = False
+
         try:
             report = scan_project(
                 args.root,
@@ -220,12 +276,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                 rule_ids=args.rule_ids,
                 exclude_paths=args.exclude_paths,
                 use_ignore_file=not args.no_ignore_file,
+                include_paths=include_paths,
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
 
+        if change_info is not None and not change_info.get("narrowed"):
+            report.limitations.append(
+                f"--changed could not narrow the scan ({change_info.get('fallback_reason')}); "
+                "the full tree was scanned instead."
+            )
+        elif change_info is not None:
+            report.limitations.append(
+                f"--changed restricted this scan to {len(include_paths or [])} changed "
+                "file(s). Unchanged files were not inspected, so this is a narrowed scan, "
+                "not a clean bill of health for the project."
+            )
+
         payload["static"] = report.to_dict()
+        if change_info is not None:
+            payload["changed_scope"] = change_info
         if not args.json:
             print(format_scan_report(report))
 

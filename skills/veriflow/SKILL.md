@@ -122,6 +122,35 @@ python <skill>\scripts\run-checks.py . --check test --execute
 python <skill>\scripts\run-checks.py . --execute --timeout 120
 ```
 
+To scope a run to what you just changed, add `--changed` (optionally with a
+base revision). It limits the test run to changed files and the tests named
+after them, and limits the security scan to changed files:
+
+```powershell
+python <skill>\scripts\run-checks.py . --changed --execute
+python <skill>\scripts\run-checks.py . --changed main --execute
+python <skill>\scripts\run-security-tests.py . --changed
+```
+
+`--changed` is a narrowing optimisation, not full verification. It selects
+tests by the `test_<module>` naming convention, so a test that exercises a
+module without naming it after that module is not picked up, and the report
+says so. When git cannot answer, the run widens to everything and states why
+rather than scanning nothing. Do not describe a `--changed` run as a full pass.
+
+Two kinds of check are **offered but not run** by a bare `--execute`, and both
+appear in the report's "Suppressed / skipped" section:
+
+- **`proposed_optional`** -- either a tool that is installed but has no project
+  configuration (labelled `default config`, so its findings may be ones the
+  project would have configured away), or a check that reaches the network.
+  Run one with `--check <name>`.
+- **`BLOCKED`** -- the tool is absent. The check carries the exact install
+  command. Never install it automatically; report the blockage and let the user
+  decide. `dependency-audit` (pip-audit / npm audit) is BLOCKED when the tool
+  is missing, which means dependency vulnerabilities are **UNKNOWN, not
+  absent** -- never report a clean dependency state you did not verify.
+
 Read the preview: the resolved executable, the resolution source
 (`project_venv`, `node_modules`, `project_script`, `system_path`, `not_found`),
 the reason, and the limitations. An unlisted check does not exist. A `not_found`
@@ -160,6 +189,21 @@ marks output matching no known diagnostic signature.
 
 Report skipped tests as skipped. Say how many of the project's checks you ran,
 not just that "the checks passed".
+
+Every report carries a **"Suppressed / skipped"** section. Read it and carry it
+forward: it lists excluded files, inline-suppressed findings, candidate secrets
+discarded as placeholders (with the reason for each), checks that were BLOCKED
+or left unrun, and whether `--changed` narrowed the scope. It is printed even
+when empty, so "Nothing was skipped" is a statement you can rely on rather than
+an absence you have to interpret. A clean findings list above an unread skipped
+section is not a clean result.
+
+A secret finding at **LOW confidence** means the value looked like a
+placeholder but carried a known provider key prefix or high entropy, so it was
+reported rather than discarded. Treat it as needing a human decision, not as
+noise: the alternative to a LOW finding here is a silently dropped live
+credential. A dropped value is always counted and explained in the skipped
+section, never removed without trace.
 
 ### 5. Repair, bounded
 
