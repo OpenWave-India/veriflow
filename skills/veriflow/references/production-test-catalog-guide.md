@@ -193,10 +193,6 @@ The mapping between catalog test cases and executable browser automation is stor
   ```bash
   python skills/veriflow/scripts/run-browser-tests.py --url http://localhost:3000 --execute
   ```
-- **Demo Runner with Fault Injection**:
-  ```bash
-  python examples/browser-demo/run-demo.py --fault broken_login
-  ```
 
 ---
 
@@ -242,10 +238,6 @@ The mapping between catalog test cases and executable API automation is defined 
 - **Via Standalone API Runner**:
   ```bash
   python skills/veriflow/scripts/run-api-tests.py --url http://127.0.0.1:8000 --execute
-  ```
-- **Demo Runner with Fault Injection**:
-  ```bash
-  python examples/api-demo/run-demo.py --fault schema
   ```
 
 ---

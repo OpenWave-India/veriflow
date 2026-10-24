@@ -1,22 +1,22 @@
 """
-Tests for the Veriflow skill installer (Claude Code and Codex).
+Tests for the Veriflow skill installer.
 
-The installer writes into a user's home directory or project, so the properties
-that matter most are the destructive ones: it must never clobber work it did
-not write, it must be reversible, it must be idempotent, and --dry-run must
-genuinely change nothing. ``--platform`` defaults to "both", so most tests
-below exercise both agents' destinations at once; a dedicated test class
-covers scoping to exactly one platform.
+The installer writes into a user's home directory or project, so the property
+that matters most is that it is reversible and idempotent. Every test here
+installs into a temporary directory; none of them touch the real ~/.claude.
 
-Every test installs into a temporary directory. None of them touch the real
-~/.claude or ~/.agents, and none of them run the installer without an explicit
-destination.
+The most important test in this file is
+``test_repository_contains_exactly_one_skill_md``. The repository once shipped
+three copies of the skill (source, plus committed .claude/ and .agents/
+copies). Any importer that scans a tree -- a downloaded zip, the plugin
+loader, the marketplace -- then found three SKILL.md files and refused to
+install. One copy in version control is the invariant that keeps installation
+working, and .gitignore is what holds the line.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -26,398 +26,162 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = REPO_ROOT / "install.py"
 SOURCE_SKILL = REPO_ROOT / "skills" / "veriflow"
-INSTALLED_SKILL_CLAUDE = REPO_ROOT / ".claude" / "skills" / "veriflow"
-INSTALLED_SKILL_CODEX = REPO_ROOT / ".agents" / "skills" / "veriflow"
-# Backwards-compatible alias used by earlier tests in this file.
-INSTALLED_SKILL = INSTALLED_SKILL_CLAUDE
 
 _spec = importlib.util.spec_from_file_location("veriflow_installer", INSTALLER)
 installer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(installer)
 
 
-def run_installer(*args: str) -> subprocess.CompletedProcess:
+def run_installer(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     """Invoke the installer as a user would."""
     return subprocess.run(
         [sys.executable, str(INSTALLER), *args],
         capture_output=True,
         text=True,
-        timeout=180,
-        cwd=str(REPO_ROOT),
+        cwd=str(cwd) if cwd else None,
     )
 
 
-class TestInstallerSafety(unittest.TestCase):
-    """The installer must not surprise anyone."""
+class TestRepositoryLayout(unittest.TestCase):
+    """The single-source invariant that makes every install path work."""
 
-    def test_a_destination_scope_is_required(self):
-        """There is no default destination, so a bare run cannot write anywhere."""
-        proc = run_installer()
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("one of the arguments", proc.stderr.lower() + proc.stdout.lower())
+    def test_repository_contains_exactly_one_skill_md(self):
+        """Multiple SKILL.md files break zip import, plugin install and the
+        marketplace alike. Only skills/veriflow/SKILL.md belongs in git."""
+        tracked = subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        ).stdout.splitlines()
+        skill_files = [p for p in tracked if p.endswith("SKILL.md")]
+        self.assertEqual(
+            skill_files,
+            ["skills/veriflow/SKILL.md"],
+            f"expected exactly one tracked SKILL.md, found: {skill_files}",
+        )
 
-    def test_project_and_personal_are_mutually_exclusive(self):
-        proc = run_installer("--project", "--personal")
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("not allowed with", proc.stderr.lower())
+    def test_no_committed_install_destinations(self):
+        """A committed .claude/skills or .agents/ copy is what created the
+        duplicate-SKILL.md failure. .gitignore must keep them out."""
+        tracked = subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        ).stdout.splitlines()
+        offenders = [p for p in tracked if p.startswith((".claude/skills/", ".agents/"))]
+        self.assertEqual(offenders, [], f"install destinations must not be tracked: {offenders}")
 
-    def test_dry_run_writes_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--dry-run")
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("nothing was written", proc.stdout.lower())
-            self.assertFalse((Path(tmp) / ".claude").exists())
-
-    def test_dry_run_reports_the_exact_destination(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--dry-run")
-            expected = str(Path(tmp).resolve() / ".claude" / "skills" / "veriflow")
-            self.assertIn(expected, proc.stdout)
-
-    def test_missing_project_root_is_an_error(self):
-        proc = run_installer("--project", "--project-root", str(REPO_ROOT / "no-such-dir-9f2a"))
-        self.assertEqual(proc.returncode, 2)
-        self.assertIn("does not exist", proc.stderr)
-
-    def test_refuses_to_overwrite_a_directory_it_did_not_write(self):
-        """The central safety property: no silent clobbering of someone's work."""
-        with tempfile.TemporaryDirectory() as tmp:
-            foreign = Path(tmp) / ".claude" / "skills" / "veriflow"
-            foreign.mkdir(parents=True)
-            sentinel = foreign / "SKILL.md"
-            sentinel.write_text("---\nname: veriflow\n---\nSomeone else's skill.\n", encoding="utf-8")
-
-            proc = run_installer("--project", "--project-root", tmp)
-
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("will not overwrite", proc.stdout)
-            self.assertIn("Someone else's skill.", sentinel.read_text(encoding="utf-8"))
-
-    def test_force_backs_up_before_replacing(self):
-        """--force is allowed to replace, but never to destroy."""
-        with tempfile.TemporaryDirectory() as tmp:
-            foreign = Path(tmp) / ".claude" / "skills" / "veriflow"
-            foreign.mkdir(parents=True)
-            (foreign / "SKILL.md").write_text("original content\n", encoding="utf-8")
-
-            proc = run_installer("--project", "--project-root", tmp, "--force")
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("backed up to", proc.stdout)
-
-            backups = list((Path(tmp) / ".claude" / "skills").glob("veriflow.backup-*"))
-            self.assertEqual(len(backups), 1, "exactly one backup must be created")
-            self.assertIn("original content", (backups[0] / "SKILL.md").read_text(encoding="utf-8"))
-            # And the real skill is now installed.
-            self.assertTrue((foreign / "scripts" / "run-checks.py").is_file())
-
-    def test_installing_creates_nothing_outside_the_skill_directories(self):
-        """Behavioural check: the installer writes only the skill directories.
-
-        Asserted by diffing the whole project tree before and after, so a stray
-        settings file, lockfile or marker written anywhere else fails the test.
-        Default scope is "both" platforms, so both .claude/ and .agents/ are
-        allowed; nothing else is.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "existing.txt").write_text("untouched\n", encoding="utf-8")
-            before = {p.relative_to(root) for p in root.rglob("*")}
-
-            proc = run_installer("--project", "--project-root", tmp)
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-
-            after = {p.relative_to(root) for p in root.rglob("*")}
-            created = after - before
-
-            allowed_prefixes = (Path(".claude"), Path(".agents"))
-            outside = sorted(
-                str(p) for p in created
-                if not any(prefix in (p, *p.parents) for prefix in allowed_prefixes)
-            )
-            self.assertEqual(outside, [], f"installer wrote outside .claude/ and .agents/: {outside}")
-
-            # Both agents' destinations were actually created.
-            self.assertTrue((root / ".claude" / "skills" / "veriflow" / "SKILL.md").is_file())
-            self.assertTrue((root / ".agents" / "skills" / "veriflow" / "SKILL.md").is_file())
-
-            # Pre-existing content is untouched.
-            self.assertEqual(
-                (root / "existing.txt").read_text(encoding="utf-8"), "untouched\n"
-            )
-
-    def test_installer_does_not_modify_claude_code_settings(self):
-        """No global configuration: the installer touches no settings file."""
-        source = INSTALLER.read_text(encoding="utf-8")
-        for forbidden in ("settings.json", "settings.local.json", "winreg", "setx("):
-            with self.subTest(token=forbidden):
-                self.assertNotIn(
-                    forbidden,
-                    source,
-                    f"the installer must never write {forbidden}",
-                )
+    def test_source_skill_has_frontmatter(self):
+        text = (SOURCE_SKILL / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---"))
+        head = text[: text.index("\n---", 4)]
+        self.assertIn("name:", head)
+        self.assertIn("description:", head)
 
 
-class TestInstallBehaviour(unittest.TestCase):
-    """Installing, updating and verifying."""
+class TestSourceFiles(unittest.TestCase):
+    def test_includes_skill_md(self):
+        self.assertIn(Path("SKILL.md"), installer.source_files())
 
-    def test_install_copies_the_skill_and_is_discoverable(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp)
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+    def test_excludes_caches_and_bytecode(self):
+        for relative in installer.source_files():
+            parts = relative.parts
+            with self.subTest(path=relative.as_posix()):
+                self.assertNotIn("__pycache__", parts)
+                self.assertNotIn(relative.suffix, installer.SKIP_SUFFIXES)
 
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-            skill_md = destination / "SKILL.md"
-            self.assertTrue(skill_md.is_file(), "Claude Code discovers a skill by its SKILL.md")
-            self.assertTrue(skill_md.read_text(encoding="utf-8").startswith("---"))
-            for required in (
-                "scripts/run-checks.py",
-                "scripts/detect-project.py",
-                "scripts/run-security-tests.py",
-                "scripts/security_scanner.py",
-                "references/production-test-catalog.json",
-                "references/repair-workflow.md",
-            ):
-                with self.subTest(path=required):
-                    self.assertTrue((destination / required).is_file())
-
-    def test_install_is_idempotent(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            first = run_installer("--project", "--project-root", tmp)
-            second = run_installer("--project", "--project-root", tmp)
-            self.assertEqual(first.returncode, 0)
-            self.assertEqual(second.returncode, 0)
-            self.assertIn("Already up to date", second.stdout)
-
-    def test_install_excludes_bytecode_caches(self):
-        """Stale .pyc files can shadow the real module, so they are never copied."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-            self.assertEqual(list(destination.rglob("__pycache__")), [])
-            self.assertEqual(list(destination.rglob("*.pyc")), [])
-
-    def test_install_writes_a_marker_recording_what_it_did(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            marker = Path(tmp) / ".claude" / "skills" / "veriflow" / installer.MARKER_FILENAME
-            self.assertTrue(marker.is_file())
-            data = json.loads(marker.read_text(encoding="utf-8"))
-            self.assertEqual(data["skill"], "veriflow")
-            self.assertEqual(data["scope"], "project")
-            self.assertGreater(data["file_count"], 10)
-            self.assertIn("installed_at", data)
-
-    def test_update_removes_a_file_no_longer_in_the_source(self):
-        """A stale file from an older version must not linger."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-            stale = destination / "references" / "removed-in-this-version.md"
-            stale.write_text("left over from an older install\n", encoding="utf-8")
-
-            proc = run_installer("--project", "--project-root", tmp)
-            self.assertEqual(proc.returncode, 0, proc.stdout)
-            self.assertFalse(stale.exists(), "a stale file must be removed on update")
-
-    def test_update_replaces_a_modified_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-            target = destination / "SKILL.md"
-            target.write_text("tampered\n", encoding="utf-8")
-
-            proc = run_installer("--project", "--project-root", tmp)
-            self.assertEqual(proc.returncode, 0)
-            self.assertEqual(
-                target.read_text(encoding="utf-8"),
-                (SOURCE_SKILL / "SKILL.md").read_text(encoding="utf-8"),
-            )
-
-    def test_installed_scripts_run_from_their_installed_location(self):
-        """The copy must work standalone, not only inside the source tree."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-
-            detect = subprocess.run(
-                [sys.executable, str(destination / "scripts" / "detect-project.py"), tmp],
-                capture_output=True, text=True, timeout=120,
-            )
-            self.assertEqual(detect.returncode, 0, detect.stderr)
-            self.assertIn("detected_types", detect.stdout)
-
-            scan = subprocess.run(
-                [sys.executable, str(destination / "scripts" / "run-security-tests.py"), tmp, "--json"],
-                capture_output=True, text=True, timeout=180,
-            )
-            payload = json.loads(scan.stdout)
-            self.assertEqual(payload["engine"], "veriflow-security")
+    def test_finds_scripts_and_references(self):
+        found = {p.as_posix() for p in installer.source_files()}
+        self.assertIn("scripts/run-checks.py", found)
+        self.assertIn("references/repair-workflow.md", found)
 
 
-class TestVerifyAndUninstall(unittest.TestCase):
-    """Diagnosing and reversing an installation."""
+class TestProjectInstall(unittest.TestCase):
+    """--project installs into ./.claude/skills/veriflow relative to cwd."""
 
-    def test_verify_reports_a_missing_installation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--verify")
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("NOT INSTALLED", proc.stdout)
+    def test_installs_then_uninstalls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            destination = project / ".claude" / "skills" / "veriflow"
 
-    def test_verify_passes_on_a_fresh_installation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            proc = run_installer("--project", "--project-root", tmp, "--verify")
-            self.assertEqual(proc.returncode, 0, proc.stdout)
-            self.assertIn("OK", proc.stdout)
+            result = run_installer("--project", cwd=project)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((destination / "SKILL.md").is_file())
+            self.assertTrue((destination / "scripts" / "run-checks.py").is_file())
 
-    def test_verify_detects_a_missing_script(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            (Path(tmp) / ".claude" / "skills" / "veriflow" / "scripts" / "run-checks.py").unlink()
-            proc = run_installer("--project", "--project-root", tmp, "--verify")
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("run-checks.py", proc.stdout)
-
-    def test_verify_detects_a_stale_installation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            target = Path(tmp) / ".claude" / "skills" / "veriflow" / "SKILL.md"
-            target.write_text("an older version\n", encoding="utf-8")
-            proc = run_installer("--project", "--project-root", tmp, "--verify")
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("out of date", proc.stdout)
-
-    def test_uninstall_removes_what_it_installed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-            self.assertTrue(destination.is_dir())
-
-            proc = run_installer("--project", "--project-root", tmp, "--uninstall")
-            self.assertEqual(proc.returncode, 0, proc.stdout)
+            result = run_installer("--project", "--uninstall", cwd=project)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(destination.exists())
 
-    def test_uninstall_refuses_a_directory_it_did_not_write(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            foreign = Path(tmp) / ".claude" / "skills" / "veriflow"
-            foreign.mkdir(parents=True)
-            (foreign / "SKILL.md").write_text("not ours\n", encoding="utf-8")
+    def test_install_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            destination = project / ".claude" / "skills" / "veriflow"
 
-            proc = run_installer("--project", "--project-root", tmp, "--uninstall")
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("Refusing to remove", proc.stdout)
-            self.assertTrue((foreign / "SKILL.md").is_file())
+            first = run_installer("--project", cwd=project)
+            listing = sorted(p.relative_to(destination).as_posix() for p in destination.rglob("*") if p.is_file())
+            second = run_installer("--project", cwd=project)
+            again = sorted(p.relative_to(destination).as_posix() for p in destination.rglob("*") if p.is_file())
 
-    def test_uninstall_dry_run_deletes_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp)
-            destination = Path(tmp) / ".claude" / "skills" / "veriflow"
-            proc = run_installer("--project", "--project-root", tmp, "--uninstall", "--dry-run")
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("Nothing was deleted", proc.stdout)
-            self.assertTrue(destination.is_dir())
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(listing, again)
 
-    def test_uninstall_of_nothing_succeeds_quietly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--uninstall")
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("Nothing installed there", proc.stdout)
+    def test_installs_every_source_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            destination = project / ".claude" / "skills" / "veriflow"
+            run_installer("--project", cwd=project)
+            for relative in installer.source_files():
+                with self.subTest(path=relative.as_posix()):
+                    self.assertTrue((destination / relative).is_file())
 
+    def test_uninstall_on_nothing_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = run_installer("--project", "--uninstall", cwd=Path(temp))
+            self.assertEqual(result.returncode, 0, result.stderr)
 
-class TestCommittedInstallationIsInSync(unittest.TestCase):
-    """The repository ships pre-installed copies for both agents.
+    def test_reinstall_removes_files_dropped_from_the_source(self):
+        """A merge-style copy would leave a removed file behind to shadow the
+        real one, so an update must replace the directory outright."""
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            destination = project / ".claude" / "skills" / "veriflow"
+            run_installer("--project", cwd=project)
 
-    They exist so that cloning Veriflow makes the skill immediately
-    discoverable by Claude Code and by Codex with no setup step. The risk is
-    drift: an edit to skills/veriflow that is never re-installed leaves a
-    stale skill in one or both repositories. These tests make that drift a
-    test failure with a one-command fix.
-    """
+            stale = destination / "references" / "dropped-in-a-later-version.md"
+            stale.write_text("stale", encoding="utf-8")
 
-    def test_committed_claude_installation_exists(self):
-        self.assertTrue(
-            (INSTALLED_SKILL_CLAUDE / "SKILL.md").is_file(),
-            "run: python install.py --project --platform claude",
-        )
+            run_installer("--project", cwd=project)
+            self.assertFalse(stale.exists())
+            self.assertTrue((destination / "SKILL.md").is_file())
 
-    def test_committed_codex_installation_exists(self):
-        self.assertTrue(
-            (INSTALLED_SKILL_CODEX / "SKILL.md").is_file(),
-            "run: python install.py --project --platform codex",
-        )
+    def test_refuses_a_destination_that_is_not_a_skill(self):
+        """Replacing the directory makes this guard load-bearing: without it an
+        unrelated directory at that path would be deleted."""
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            destination = project / ".claude" / "skills" / "veriflow"
+            destination.mkdir(parents=True)
+            keep = destination / "someone-elses-work.txt"
+            keep.write_text("do not delete", encoding="utf-8")
 
-    def test_committed_claude_installation_matches_the_source(self):
-        plan = installer.classify(INSTALLED_SKILL_CLAUDE, installer.iter_source_files())
-        self.assertEqual(
-            (plan["new"], plan["changed"], plan["stale"]),
-            ([], [], []),
-            "the committed .claude/skills/veriflow has drifted from skills/veriflow. "
-            "Re-sync with: python install.py --project --platform claude",
-        )
-
-    def test_committed_codex_installation_matches_the_source(self):
-        plan = installer.classify(INSTALLED_SKILL_CODEX, installer.iter_source_files())
-        self.assertEqual(
-            (plan["new"], plan["changed"], plan["stale"]),
-            ([], [], []),
-            "the committed .agents/skills/veriflow has drifted from skills/veriflow. "
-            "Re-sync with: python install.py --project --platform codex",
-        )
-
-    def test_resolve_personal_destination_points_at_the_documented_path(self):
-        """The documented personal paths must be the ones the code actually uses."""
-        self.assertEqual(
-            installer.personal_skills_dir("claude") / "veriflow",
-            Path.home() / ".claude" / "skills" / "veriflow",
-        )
-        self.assertEqual(
-            installer.personal_skills_dir("codex") / "veriflow",
-            Path.home() / ".agents" / "skills" / "veriflow",
-        )
+            result = run_installer("--project", cwd=project)
+            self.assertEqual(result.returncode, 2)
+            self.assertTrue(keep.is_file())
 
 
-class TestPlatformSelection(unittest.TestCase):
-    """--platform scopes which agent(s) are touched."""
+class TestCommandLine(unittest.TestCase):
+    def test_help_works(self):
+        result = run_installer("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--project", result.stdout)
 
-    def test_platform_claude_only_writes_claude_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--platform", "claude")
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertTrue((Path(tmp) / ".claude" / "skills" / "veriflow" / "SKILL.md").is_file())
-            self.assertFalse((Path(tmp) / ".agents").exists())
-
-    def test_platform_codex_only_writes_codex_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--platform", "codex")
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertTrue((Path(tmp) / ".agents" / "skills" / "veriflow" / "SKILL.md").is_file())
-            self.assertFalse((Path(tmp) / ".claude").exists())
-
-    def test_platform_both_is_the_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp)
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertTrue((Path(tmp) / ".claude" / "skills" / "veriflow" / "SKILL.md").is_file())
-            self.assertTrue((Path(tmp) / ".agents" / "skills" / "veriflow" / "SKILL.md").is_file())
-
-    def test_invalid_platform_value_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = run_installer("--project", "--project-root", tmp, "--platform", "gemini")
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("invalid choice", proc.stderr.lower())
-
-    def test_codex_installed_scripts_run_from_their_installed_location(self):
-        """The Codex copy must work standalone too, not only the Claude copy."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run_installer("--project", "--project-root", tmp, "--platform", "codex")
-            destination = Path(tmp) / ".agents" / "skills" / "veriflow"
-
-            detect = subprocess.run(
-                [sys.executable, str(destination / "scripts" / "detect-project.py"), tmp],
-                capture_output=True, text=True, timeout=120,
-            )
-            self.assertEqual(detect.returncode, 0, detect.stderr)
-            self.assertIn("detected_types", detect.stdout)
+    def test_unknown_flag_is_a_usage_error(self):
+        result = run_installer("--platform", "codex")
+        self.assertEqual(result.returncode, 2)
 
 
 if __name__ == "__main__":

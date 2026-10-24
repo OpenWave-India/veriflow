@@ -6,22 +6,40 @@ scans for security defects, diagnoses failures from actual evidence, and
 reports exactly what passed, what failed, and what it couldn't check — never
 a guess dressed up as a pass.
 
-Works as a skill for **Claude Code** and **Codex**.
+A skill for **Claude Code**.
 
 ## Install
 
-**Claude Code** — paste these two lines into a session:
+Paste these two lines into a Claude Code session:
 
 ```text
 /plugin marketplace add OpenWave-India/veriflow
 /plugin install veriflow@veriflow
 ```
 
-That's the whole install. No cloning, no scripts.
+Restart Claude Code. That's it — no cloning, no scripts.
 
-**Codex, or a manual setup** — see [`INSTALL.md`](INSTALL.md) for the
-one-command installer (`install.py`), which also covers updating,
-uninstalling, and running Veriflow without any agent at all.
+<details>
+<summary>Without the marketplace</summary>
+
+Clone and run the installer. It copies one directory and changes no setting:
+
+```powershell
+git clone https://github.com/OpenWave-India/veriflow.git
+cd veriflow
+python install.py              # all your projects (~/.claude/skills/)
+python install.py --project    # just this repo (./.claude/skills/)
+```
+
+Restart Claude Code afterwards, then ask: *what skills do you have available?*
+
+**Update:** `git pull` and run `python install.py` again.
+**Remove:** `python install.py --uninstall`.
+
+</details>
+
+**Updating the plugin:** `/plugin` → **Installed** → `veriflow` → **Update
+now**. If an install ever fails, `/plugin` → **Errors** shows the reason.
 
 ## Why this exists
 
@@ -46,15 +64,15 @@ is built so none of that can happen silently:
 - **Redacts secrets** before they ever reach a report.
 
 <details>
-<summary><strong>What Claude Code and Codex don't do on their own</strong></summary>
+<summary><strong>What Claude Code doesn't do on its own</strong></summary>
 
-Both are general-purpose agents with shell access — they can run anything
-you ask. What neither ships with:
+It's a general-purpose agent with shell access — it can run anything you
+ask. What it doesn't ship with:
 
-- **A real security scanner.** Ask either to "check for vulnerabilities"
-  and you get the model's judgment, no deterministic rules behind it.
-- **Dependency identity verification** before you install something an
-  agent just suggested.
+- **A real security scanner.** Ask it to "check for vulnerabilities" and you
+  get the model's judgment, no deterministic rules behind it.
+- **Dependency identity verification** before you install something it
+  just suggested.
 - **A structural result type.** By default, nothing stops an agent from
   saying "tests pass" when a tool was simply missing.
 - **An enforced repair budget**, rather than a promise the agent can break.
@@ -152,7 +170,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-480+ tests, including a fault-injection test per security rule proving it
+450+ tests, including a fault-injection test per security rule proving it
 actually detects what it claims to.
 
 ## Limitations
@@ -165,6 +183,16 @@ actually detects what it claims to.
   detection but thinner diagnosis.
 - The audit's catalog section is a scope summary of all 145 cases, not
   filtered to your project — see `references/production-readiness.md`.
+
+## Future scope
+
+- **Codex support.** Veriflow is a plain Agent Skill, and Codex reads the same
+  `SKILL.md` shape from `.agents/skills/`. Earlier versions shipped a second
+  committed copy there, which made every importer see more than one `SKILL.md`
+  and refuse to install, so it was removed. Re-adding it means generating that
+  copy at install time, not committing it.
+- A bundled CVE feed, so vulnerability data needs no second tool.
+- Taint-based security analysis to complement the pattern rules.
 
 ## License
 

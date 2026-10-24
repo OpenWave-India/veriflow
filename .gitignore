@@ -22,3 +22,10 @@ htmlcov/
 # Veriflow repair-attempt budget sessions: ephemeral per-verification-session
 # working state, not something to commit to any project this runs against.
 .veriflow/
+
+# Installed copies of the skill. skills/veriflow/ is the single source; an
+# install copies it here. Committing a copy means the repo ships two SKILL.md
+# files, and every importer (zip, plugin, marketplace) then refuses with
+# "multiple SKILL.md found". Keep exactly one in version control.
+.claude/skills/
+.agents/

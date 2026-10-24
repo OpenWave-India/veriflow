@@ -76,7 +76,7 @@ Resolve the skill directory before building any command. In order:
 
 Confirm `scripts/run-checks.py` exists at the path you resolved before using
 it. If no location has it, say the skill is not fully installed and point to
-`INSTALL.md`. Do not guess a path and do not invent a command.
+the repository `README.md`. Do not guess a path and do not invent a command.
 
 ## Workflow
 
