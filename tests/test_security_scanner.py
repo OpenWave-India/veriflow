@@ -23,6 +23,10 @@ from skills.veriflow.scripts.security_scanner import (
     SECURITY_RULES,
     SUPPRESSION_MARKER,
     ScanReport,
+    VERDICT_DROP,
+    VERDICT_LOW,
+    VERDICT_REPORT,
+    classify_secret_value,
     format_scan_report,
     iter_scannable_files,
     redact_line,
@@ -228,6 +232,14 @@ class TestFalsePositiveControl(unittest.TestCase):
             )
 
     def test_placeholder_credentials_are_not_reported(self):
+        """Unambiguous placeholders still drop.
+
+        Note what is NOT in this list any more: a value carrying a provider key
+        prefix. 'AKIAIOSFODNN7EXAMPLE' used to be dropped here purely because
+        it contains "EXAMPLE", which is the behaviour that let a real AKIA key
+        in a file named example.py go unreported. It now has its own test
+        asserting LOW confidence instead.
+        """
         placeholders = [
             'PASSWORD = "your-password-here"',
             'API_KEY = "REDACTED"',
@@ -235,7 +247,6 @@ class TestFalsePositiveControl(unittest.TestCase):
             'TOKEN = "xxxxxxxxxxxxxxxx"',
             'PASSWORD = os.environ["DB_PASSWORD"]',
             'SECRET_KEY = "${VAULT_SECRET}"',
-            'API_KEY = "AKIAIOSFODNN7EXAMPLE"',
         ]
         for line in placeholders:
             with self.subTest(line=line):
@@ -248,6 +259,20 @@ class TestFalsePositiveControl(unittest.TestCase):
                     self.assertEqual(
                         report.findings, [], f"placeholder reported as a secret: {line}"
                     )
+
+    def test_a_dropped_placeholder_is_disclosed_not_silent(self):
+        """A drop must leave a trace. Otherwise a suppressed true positive and a
+        scanner that never looked are indistinguishable in the report."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conf.py").write_text('API_KEY = "your-key-here-abc"\n', encoding="utf-8")
+            report = scan_project(root, rule_ids=["SEC-SECRET-001", "SEC-SECRET-003"])
+            self.assertEqual(report.findings, [])
+            self.assertTrue(
+                report.dropped_placeholders,
+                "value was dropped without being recorded anywhere",
+            )
+            self.assertTrue(all(item.get("reason") for item in report.dropped_placeholders))
 
     def test_vendor_directories_are_not_scanned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -331,7 +356,7 @@ class TestScanBoundaries(unittest.TestCase):
             nested.mkdir(parents=True)
             target = nested / "dao.py"
             target.write_text('cursor.execute(f"SELECT * FROM t WHERE id={i}")\n', encoding="utf-8")
-            findings, _ = scan_file(target, root)
+            findings, _, _ = scan_file(target, root)
             self.assertTrue(findings)
             self.assertFalse(Path(findings[0].file).is_absolute())
             self.assertIn("dao.py", findings[0].file)
@@ -435,6 +460,180 @@ class TestScannerCli(unittest.TestCase):
             text = format_scan_report(report)
             non_ascii = sorted({c for c in text if ord(c) > 126})
             self.assertEqual(non_ascii, [], f"non-ASCII in report output: {non_ascii}")
+
+
+class TestSoftPlaceholderDowngrade(unittest.TestCase):
+    """A placeholder-looking word must not silently erase a credential.
+
+    The old scanner dropped any value containing "example", "test" or "dummy".
+    That is the single highest-cost false negative a secret scanner can have:
+    real keys live in files called test_settings.py and under names like
+    EXAMPLE_API_KEY all the time, and a silent drop is indistinguishable from
+    a scanner that never looked. These now report at LOW confidence, which puts
+    the decision in front of a reviewer instead of discarding it.
+    """
+
+    def _scan_line(self, line: str, filename: str = "conf.py"):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / filename).write_text(line + "\n", encoding="utf-8")
+            return scan_project(root, rule_ids=["SEC-SECRET-001", "SEC-SECRET-003"])
+
+    def test_known_prefix_with_placeholder_word_is_reported_at_low(self):
+        """A provider-issued prefix outranks any wording around it.
+
+        Variable names here must be ones SEC-SECRET-001 recognises (api_key,
+        client_secret, access_token, ...); the AKIA case is matched by
+        SEC-SECRET-003 regardless of the name.
+        """
+        for line in (
+            'API_KEY = "AKIAIOSFODNN7EXAMPLE"',
+            'CLIENT_SECRET = "sk_live_example1234567890abcd"',
+            'ACCESS_TOKEN = "ghp_test_testtesttesttesttesttest1234"',
+            'AUTH_TOKEN = "xoxb-dummy-000000000000-abcdefghijklmnop"',
+        ):
+            with self.subTest(line=line):
+                report = self._scan_line(line)
+                self.assertTrue(report.findings, f"known-prefix key dropped: {line}")
+                self.assertEqual(report.findings[0].confidence, "LOW")
+
+    def test_high_entropy_with_placeholder_word_is_reported_at_low(self):
+        """No known prefix, but the value is clearly generated, not written."""
+        report = self._scan_line('API_KEY = "example_Kf8sLq2mXz9vNb4tRw7pQj3hYd6c"')
+        self.assertTrue(report.findings, "high-entropy value dropped for saying 'example'")
+        self.assertEqual(report.findings[0].confidence, "LOW")
+
+    def test_low_entropy_with_placeholder_word_still_drops(self):
+        """The downgrade is not a licence to report every synthetic string."""
+        report = self._scan_line('API_KEY = "example_value_here"')
+        self.assertEqual(report.findings, [])
+
+    def test_a_word_merely_containing_test_is_not_a_placeholder(self):
+        """Segment-aware matching: 'latest' must not read as 'test'."""
+        verdict, _ = classify_secret_value("Kf8sLq2mXz9latestNb4tRw7pQj3hYd6c")
+        self.assertEqual(verdict, VERDICT_REPORT)
+
+    def test_downgrade_reason_is_stated_on_the_finding(self):
+        report = self._scan_line('API_KEY = "example_Kf8sLq2mXz9vNb4tRw7pQj3hYd6c"')
+        self.assertIn("LOW confidence", report.findings[0].false_positives)
+        self.assertIn("entropy", report.findings[0].false_positives.lower())
+
+    def test_a_real_key_in_a_test_file_is_still_found(self):
+        """The original failure mode, stated as a test."""
+        report = self._scan_line('API_KEY = "AKIA2JQ7XNVB4KD9WLZT"', filename="test_settings.py")
+        self.assertTrue(report.findings, "a real AKIA key in a test file went unreported")
+
+    def test_low_confidence_findings_are_counted_in_the_report(self):
+        report = self._scan_line('API_KEY = "example_Kf8sLq2mXz9vNb4tRw7pQj3hYd6c"')
+        self.assertEqual(report.low_confidence_count(), 1)
+        self.assertEqual(report.to_dict()["low_confidence_findings"], 1)
+
+    def test_downgraded_value_is_still_redacted(self):
+        """A LOW-confidence finding is still a finding: it must not print the value."""
+        secret = "example_Kf8sLq2mXz9vNb4tRw7pQj3hYd6c"
+        report = self._scan_line(f'API_KEY = "{secret}"')
+        self.assertNotIn(secret, report.findings[0].evidence)
+        self.assertNotIn(secret, format_scan_report(report))
+
+
+class TestSkippedSection(unittest.TestCase):
+    """Every report states what it did not cover.
+
+    An absent section reads as "nothing was hidden" whether or not that is
+    true, so the block is unconditional and says so explicitly when empty.
+    """
+
+    def test_section_is_present_even_when_nothing_was_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            text = format_scan_report(scan_project(root))
+            self.assertIn("Suppressed / skipped:", text)
+            self.assertIn("Nothing was skipped", text)
+
+    def test_dropped_placeholders_are_listed_with_counts_and_reasons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conf.py").write_text(
+                'API_KEY = "your-key-here-abc"\nPASSWORD = "changeme123456"\n',
+                encoding="utf-8",
+            )
+            report = scan_project(root, rule_ids=["SEC-SECRET-001"])
+            text = format_scan_report(report)
+            self.assertIn("Suppressed / skipped:", text)
+            self.assertIn("discarded as placeholders", text)
+            self.assertIn("unambiguous placeholder", text)
+
+    def test_low_confidence_downgrades_are_disclosed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conf.py").write_text(
+                'API_KEY = "example_Kf8sLq2mXz9vNb4tRw7pQj3hYd6c"\n', encoding="utf-8"
+            )
+            text = format_scan_report(scan_project(root, rule_ids=["SEC-SECRET-001"]))
+            self.assertIn("LOW confidence rather than discarded", text)
+
+    def test_natively_low_rules_are_not_counted_as_downgrades(self):
+        """Several rules are LOW by definition (SEC-PATH-001, SEC-REDIR-001).
+
+        Counting `confidence == "LOW"` reported those as values rescued from a
+        placeholder drop, which is a false statement in the report: nothing was
+        downgraded at all. Only the classifier sets confidence_downgraded.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "views.py").write_text(
+                "open(os.path.join(base, request.args['f']))\n", encoding="utf-8"
+            )
+            report = scan_project(root, rule_ids=["SEC-PATH-001"])
+            self.assertTrue(report.findings, "fixture did not trigger the LOW rule")
+            self.assertEqual(report.findings[0].confidence, "LOW")
+            self.assertFalse(report.findings[0].confidence_downgraded)
+            self.assertEqual(report.low_confidence_count(), 0)
+            self.assertNotIn("rather than discarded", format_scan_report(report))
+
+    def test_inline_suppression_is_disclosed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "run.py").write_text(
+                'subprocess.run("ls " + n, shell=True)  # veriflow: allow-security\n',
+                encoding="utf-8",
+            )
+            text = format_scan_report(scan_project(root, rule_ids=["SEC-INJ-001"]))
+            self.assertIn("silenced by an inline", text)
+
+
+class TestSecretValueClassifier(unittest.TestCase):
+    """Unit-level coverage of the three-way verdict."""
+
+    def test_obvious_placeholders_drop(self):
+        for value in ("xxxxxxxxxxxx", "<your-api-key>", "changeme123456", "REDACTED"):
+            with self.subTest(value=value):
+                verdict, reason = classify_secret_value(value)
+                self.assertEqual(verdict, VERDICT_DROP)
+                self.assertTrue(reason)
+
+    def test_environment_lookups_drop(self):
+        verdict, _ = classify_secret_value('os.environ["DB_PASSWORD"]')
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_known_prefixes_report(self):
+        for value in ("sk_live_51H8xKqLm2Nv9Pw", "AKIA2JQ7XNVB4KD9WLZT", "ghp_aB3xK9mQ7pL2wZ8n"):
+            with self.subTest(value=value):
+                verdict, _ = classify_secret_value(value)
+                self.assertEqual(verdict, VERDICT_REPORT)
+
+    def test_prefix_plus_placeholder_word_is_low_not_drop(self):
+        verdict, reason = classify_secret_value("sk_live_example1234567890")
+        self.assertEqual(verdict, VERDICT_LOW)
+        self.assertIn("prefix", reason)
+
+    def test_every_verdict_except_report_states_a_reason(self):
+        for value in ("short", "aaaaaaaaaaaa", "example_value_here", "<your-key>"):
+            with self.subTest(value=value):
+                verdict, reason = classify_secret_value(value)
+                self.assertNotEqual(verdict, VERDICT_REPORT)
+                self.assertTrue(reason, f"no reason given for dropping {value!r}")
 
 
 if __name__ == "__main__":
