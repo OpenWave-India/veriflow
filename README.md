@@ -1,199 +1,226 @@
 # Veriflow
 
-Veriflow helps AI coding agents verify their own work instead of just
-claiming it's done. It discovers a project's real checks, runs them safely,
-scans for security defects, diagnoses failures from actual evidence, and
-reports exactly what passed, what failed, and what it couldn't check — never
-a guess dressed up as a pass.
+**Verify AI-generated code with evidence, not assumptions.**
 
-A skill for **Claude Code**.
+Veriflow is a verification skill for Claude Code that helps AI coding agents check their work before declaring it complete. It discovers project checks, executes them through controlled workflows, scans for common security defects, diagnoses failures, and reports what passed, failed, or could not be verified.
 
-## Install
+Instead of trusting an agent's claim that everything works, Veriflow helps you see the evidence.
 
-Paste these two lines into a Claude Code session:
+## Quick Start
+
+### Option 1: Install through the Claude Code plugin marketplace
+
+Run these commands inside a Claude Code session:
 
 ```text
 /plugin marketplace add OpenWave-India/veriflow
 /plugin install veriflow@veriflow
 ```
 
-Restart Claude Code. That's it — no cloning, no scripts.
+Restart Claude Code if necessary, then check that Veriflow is available.
 
-<details>
-<summary>Without the marketplace</summary>
+### Option 2: Install manually
 
-Clone and run the installer. It copies one directory and changes no setting:
+Clone the repository and run the installer:
 
-```powershell
+```bash
 git clone https://github.com/OpenWave-India/veriflow.git
 cd veriflow
-python install.py              # all your projects (~/.claude/skills/)
-python install.py --project    # just this repo (./.claude/skills/)
 ```
 
-Restart Claude Code afterwards, then ask: *what skills do you have available?*
+Install for all your projects:
 
-**Update:** `git pull` and run `python install.py` again.
-**Remove:** `python install.py --uninstall`.
+```bash
+python install.py
+```
 
-</details>
+Or install only for the current project:
 
-**Updating the plugin:** `/plugin` → **Installed** → `veriflow` → **Update
-now**. If an install ever fails, `/plugin` → **Errors** shows the reason.
+```bash
+python install.py --project
+```
 
-## Why this exists
+Restart Claude Code afterwards. You can then ask Claude Code to list its available skills and confirm that Veriflow is loaded.
 
-An AI agent can say "all tests pass" without running anything, quietly
-weaken a test to make it green, or treat a missing tool as a pass. Veriflow
-is built so none of that can happen silently:
+**Update:** Pull the latest repository changes and rerun the installer for your chosen installation scope.
 
-- **Discovers real checks** for the project's actual ecosystem (Python,
-  JS/TS, Rust, Go, Java, .NET) — without running them until told to.
-- **Scans for security defects** — 26 static rules (secrets, injection,
-  unsafe deserialization, weak crypto) plus 9 opt-in live checks (headers,
-  cookies, auth, IDOR, CSRF), each proven against a real fault it has to
-  catch, not just a demo that happens to pass.
-- **Catches hallucinated dependencies** — checks every package in
-  `requirements.txt` / `package.json` against the real PyPI/npm registry.
-- **Reports in seven honest states** — `PASS`, `FAIL`, `BLOCKED`, `NOT_RUN`,
-  `NOT_APPLICABLE`, `MANUAL_REVIEW`, `UNKNOWN`. A missing tool can never be
-  reported as a pass.
-- **Enforces its own repair limit** — caps an agent at 3 fix attempts per
-  issue with a real persisted counter, not just an instruction it could
-  ignore.
-- **Redacts secrets** before they ever reach a report.
+**Uninstall:** Run `python install.py --uninstall` using the same installation scope, after checking the installer's behavior for your version.
 
-<details>
-<summary><strong>What Claude Code doesn't do on its own</strong></summary>
+For plugin installations, manage updates through Claude Code's `/plugin` interface.
 
-It's a general-purpose agent with shell access — it can run anything you
-ask. What it doesn't ship with:
+## Why Veriflow?
 
-- **A real security scanner.** Ask it to "check for vulnerabilities" and you
-  get the model's judgment, no deterministic rules behind it.
-- **Dependency identity verification** before you install something it
-  just suggested.
-- **A structural result type.** By default, nothing stops an agent from
-  saying "tests pass" when a tool was simply missing.
-- **An enforced repair budget**, rather than a promise the agent can break.
-- **Output redaction**, so a leaked secret in command output doesn't just
-  print straight to your terminal.
+AI coding agents can produce working code, but they can also overlook broken tests, introduce unsafe patterns, recommend nonexistent dependencies, or claim success when a required tool is unavailable.
 
-What's *not* unique here: preview-before-execute, safe subprocess handling —
-an agent could write that itself if asked. The value is that it's already
-written, already tested against real faults, and ships as a skill instead of
-something you re-explain every session.
+Veriflow provides a structured way to verify those claims using actual checks and explicit result states.
 
-</details>
+### Key Features
 
-## See it work
+- **Project-aware check discovery:** Detects common test, lint, type-check, and build workflows across Python, JavaScript/TypeScript, Rust, Go, Java, and .NET.
+- **Static security scanning:** Includes 26 static rules targeting patterns such as exposed secrets, injection, unsafe deserialization, and weak cryptography.
+- **Opt-in live security checks:** Includes nine checks for areas such as security headers, cookies, authentication, IDOR, and CSRF.
+- **Dependency identity checks:** Checks package identities against the relevant registries to help flag suspicious or potentially hallucinated dependencies.
+- **Evidence-based diagnostics:** Uses observed failures to help explain what went wrong instead of guessing.
+- **Structured result states:** Distinguishes `PASS`, `FAIL`, `BLOCKED`, `NOT_RUN`, `NOT_APPLICABLE`, `MANUAL_REVIEW`, and `UNKNOWN`.
+- **Bounded repair attempts:** Implements a persisted three-attempt limit per issue.
+- **Credential redaction:** Redacts detected secrets from supported captured output before including it in reports.
+- **Machine-readable reporting:** Supports JSON output, with Markdown reports available for the full audit workflow.
+- **Production-readiness guidance:** Includes a 145-case catalog and a reference covering recurring AI coding failure patterns.
 
-A real, unedited run against Veriflow's own demo project — proof it
-genuinely catches things, not just a clean report every time:
+Feature availability depends on the engine, project, and installed optional tools.
 
-```powershell
+## See It in Action
+
+Veriflow includes a repair demo that illustrates how its audit workflow responds to clean code and deliberately introduced security defects.
+
+Run the demo audit:
+
+```bash
 python skills/veriflow/scripts/run-audit.py examples/repair-demo --execute
 ```
 
-```
-2. STATIC SECURITY SCAN  (read-only, offline, always runs)
-   Findings: CRITICAL=0 HIGH=0 MEDIUM=0 LOW=0  (scanned 4 file(s))
-3. CORE CHECKS  (1 discovered)
-   [PASS] test (python)
-----------------------------------------------------------------
+A clean demo run can produce a result similar to:
+
+```text
+STATIC SECURITY SCAN
+Findings: CRITICAL=0 HIGH=0 MEDIUM=0 LOW=0
+
+CORE CHECKS
+[PASS] test (python)
+
 VERDICT: READY_WITH_RISKS
 ```
 
-Same command against a file with a real bug planted in it:
+When the demo contains deliberately introduced vulnerabilities, the scanner can report findings such as:
 
-```
-2. STATIC SECURITY SCAN  (read-only, offline, always runs)
-   Findings: CRITICAL=2 HIGH=0 MEDIUM=0 LOW=0  (scanned 1 file(s))
-     [CRITICAL] SEC-INJ-001    app.py:4   (shell injection via shell=True)
-     [CRITICAL] SEC-DESER-001  app.py:7   (unsafe pickle.loads)
-----------------------------------------------------------------
+```text
+[CRITICAL] SEC-INJ-001    app.py:4
+           Shell injection via shell=True
+
+[CRITICAL] SEC-DESER-001  app.py:7
+           Unsafe pickle.loads
+
 VERDICT: NOT_READY
 ```
 
-Add `--markdown report.md` for a shareable file instead of terminal output.
-Every rule has a test proving it fails on the defect it claims to catch and
-passes once that defect is fixed — this isn't a cherry-picked demo, the test
-suite enforces it.
+Exact output depends on the demo state and the checks available in your environment. These snippets illustrate the expected behavior rather than guaranteeing identical output on every run.
 
-## Verification engines
+For the full audit workflow, use `--markdown report.md` to write a Markdown report.
 
-| Engine | Covers |
-| :--- | :--- |
-| **Full audit** (`run-audit.py`) | Everything below, combined into one verdict |
-| Core runner | test / lint / type-check / build |
-| Security | 26 static rules + 9 opt-in live checks |
-| API / OpenAPI | Contract, auth, error handling — local service only |
-| Browser | 15 Playwright user-journey templates |
-| Dependency check | Flags hallucinated or brand-new packages |
-| Repair budget | Enforces the 3-attempt cap with a real counter |
+## Verification Engines
 
-The static security scan needs no setup at all. Live checks, the API
-engine, and the OpenAPI engine only ever target `localhost`. Browser checks
-need Playwright; without it, they report `BLOCKED`, never a false pass.
+| Engine | Purpose |
+|---|---|
+| Full audit | Combines available verification stages into an overall readiness verdict |
+| Core runner | Discovers and runs relevant tests, linting, type checks, and builds |
+| Security scanner | Applies static security rules and supported opt-in live checks |
+| API verification | Checks API behavior, including authentication and error handling |
+| OpenAPI verification | Checks API contracts against OpenAPI specifications |
+| Browser verification | Runs supported browser journeys using Playwright |
+| Dependency verification | Helps identify questionable or nonexistent package dependencies |
+| Repair budget | Tracks and enforces a configured limit on repair attempts |
 
-Also included: a 145-case production-readiness catalog and a failure-pattern
-reference cataloguing recurring AI-coding mistakes — both in
-`skills/veriflow/references/`.
+### Execution and Safety
+
+Veriflow distinguishes discovery from execution so you can inspect the checks before running them.
+
+- The core runner supports previewing discovered checks before execution.
+- The static security scanner is designed to run offline and read project files without modifying them.
+- Live security and API checks are intended for local services.
+- Browser verification requires Playwright.
+- YAML OpenAPI specifications require PyYAML; JSON specifications can be used without it.
+- Missing optional tools should be reported as blocked or otherwise explicitly unavailable, rather than treated as successful verification.
+
+Always review commands and live-check targets before executing them on an unfamiliar project.
 
 ## Requirements
 
-Python 3.9+. Everything above is pure standard library — nothing to install
-for the core runner, the audit, the API engine, or the security scan.
+- Python 3.9 or later.
+- Claude Code for the skill integration.
+- Optional packages for specific capabilities.
 
-Two optional packages, each for one thing only:
+| Package | Used for | Without it |
+|---|---|---|
+| `playwright` | Browser journeys | Browser checks may report `BLOCKED` |
+| `PyYAML` | YAML OpenAPI specifications | JSON specifications remain available |
 
-| Package | Unlocks | Without it |
-| :--- | :--- | :--- |
-| `playwright` | Browser journeys | Reports `BLOCKED` |
-| `PyYAML` | YAML OpenAPI specs | JSON specs still work |
+The core runner and static security scanner are designed around the Python standard library. Individual verification engines may have additional requirements depending on the workflow.
 
-## Try it
+## Running Veriflow Directly
 
-```powershell
-python skills/veriflow/scripts/detect-project.py .          # what's here?
-python skills/veriflow/scripts/run-checks.py .               # preview only
-python skills/veriflow/scripts/run-checks.py . --execute      # actually run
-python skills/veriflow/scripts/run-security-tests.py .        # security scan
+You can invoke the scripts from the repository root without going through the Claude Code skill.
+
+### Discover project checks
+
+```bash
+python skills/veriflow/scripts/detect-project.py .
 ```
 
-Add `--json` to any command for a machine-readable report.
+### Preview discovered checks
 
-## Running the tests
+```bash
+python skills/veriflow/scripts/run-checks.py .
+```
 
-```powershell
+### Execute discovered checks
+
+```bash
+python skills/veriflow/scripts/run-checks.py . --execute
+```
+
+### Run the security scanner
+
+```bash
+python skills/veriflow/scripts/run-security-tests.py .
+```
+
+Use `--json` where supported to obtain machine-readable output. Consult each script's help output for the available options.
+
+## Running the Tests
+
+Install the development dependencies:
+
+```bash
 pip install -r requirements-dev.txt
+```
+
+Run the test suite:
+
+```bash
 python -m pytest tests -q
 ```
 
-450+ tests, including a fault-injection test per security rule proving it
-actually detects what it claims to.
+The project has reported more than 450 tests, including fault-injection tests for security rules. Run the suite against your current checkout to confirm its actual test count and results.
 
 ## Limitations
 
-- Pattern-based security scanning, not taint analysis — reduces common
-  issues, isn't a penetration test.
-- No bundled CVE database — run `pip-audit` / `npm audit` / `cargo audit`
-  for vulnerability data.
-- Deep diagnostics are strongest for Python and JS/TS; other ecosystems get
-  detection but thinner diagnosis.
-- The audit's catalog section is a scope summary of all 145 cases, not
-  filtered to your project — see `references/production-readiness.md`.
+Veriflow helps improve verification; it does not guarantee that software is defect-free.
 
-## Future scope
+- **Pattern-based security scanning:** Static rules are not equivalent to full taint analysis or a professional penetration test.
+- **No bundled CVE database:** Use dedicated tools such as `pip-audit`, `npm audit`, or `cargo audit` for vulnerability database checks.
+- **Uneven diagnostic depth:** Diagnostics are strongest for Python and JavaScript/TypeScript; other ecosystems may have less detailed support.
+- **Optional tooling:** Browser and YAML-based checks depend on their respective packages.
+- **Catalog scope:** The production-readiness catalog summarizes its full set of cases; it is not necessarily filtered to the current project's technology or requirements.
 
-- **Codex support.** Veriflow is a plain Agent Skill, and Codex reads the same
-  `SKILL.md` shape from `.agents/skills/`. Earlier versions shipped a second
-  committed copy there, which made every importer see more than one `SKILL.md`
-  and refuse to install, so it was removed. Re-adding it means generating that
-  copy at install time, not committing it.
-- A bundled CVE feed, so vulnerability data needs no second tool.
-- Taint-based security analysis to complement the pattern rules.
+Treat reports as evidence about the checks actually performed, not proof that every possible defect has been ruled out.
+
+## Future Directions
+
+Potential future work includes:
+
+- **Codex support:** Generate compatible skill files at installation time without maintaining duplicate committed skill copies.
+- **Bundled vulnerability data:** Add an optional or bundled CVE feed.
+- **Deeper security analysis:** Complement pattern-based scanning with more advanced analysis techniques.
+
+These are future directions, not claims about currently implemented functionality.
+
+## Contributing
+
+Contributions, bug reports, and reproducible failure cases can help improve Veriflow.
+
+When reporting an issue, include the relevant command, expected behavior, actual result, and any sanitized logs or minimal reproduction steps. Never include API keys, passwords, or other secrets.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+Veriflow is released under the [MIT License](https://github.com/OpenWave-India/veriflow/blob/main/LICENSE).
+
