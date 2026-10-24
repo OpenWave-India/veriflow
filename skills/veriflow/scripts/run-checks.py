@@ -34,6 +34,23 @@ def _load_detector():
 _detect_project_fn = _load_detector()
 
 
+def _load_changed_files():
+    """Load the shared changed-files helper from the same directory."""
+    script_path = Path(__file__).parent / "changed_files.py"
+    if script_path.is_file():
+        try:
+            spec = importlib.util.spec_from_file_location("veriflow_changed_files", script_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception:
+            return None
+    return None
+
+
+_changed_files_mod = _load_changed_files()
+
+
 def _load_browser_detector():
     """Load detect_browser_environment from browser_detector.py in the same directory."""
     script_path = Path(__file__).parent / "browser_detector.py"
@@ -89,6 +106,136 @@ def _find_python_environment(root: Path) -> dict | None:
                 "scripts_dirs": scripts_dirs,
             }
     return None
+
+
+def _interpreter_version(python_exe: Path) -> str | None:
+    """Return an interpreter's version without running it.
+
+    Executing a binary found on PATH during *discovery* would break the
+    preview-by-default rule, so the version is read off the filesystem:
+
+    1. ``pyvenv.cfg`` beside the environment root records ``version = 3.13.3``.
+    2. A POSIX install exposes ``lib/python3.13/``.
+    3. A Windows install exposes ``python313.dll``.
+
+    Returns None when none of those are present, in which case the caller says
+    "unknown version" rather than guessing.
+    """
+    try:
+        bin_dir = python_exe.parent
+        for cfg in (bin_dir.parent / "pyvenv.cfg", bin_dir / "pyvenv.cfg"):
+            if cfg.is_file():
+                for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                    key, _, value = line.partition("=")
+                    if key.strip() in ("version", "version_info"):
+                        return value.strip()
+
+        # Search the interpreter's own directory as well as one level up: a
+        # virtual environment keeps python in Scripts/ or bin/ with lib/ beside
+        # it, while a system install puts python.exe in the root next to
+        # python313.dll. Checking only the parent misses the system layout and
+        # silently degrades every version to "unknown".
+        for directory in (bin_dir, bin_dir / "lib", bin_dir / "Lib", bin_dir.parent, bin_dir.parent / "lib"):
+            if not directory.is_dir():
+                continue
+            for child in directory.iterdir():
+                name = child.name
+                if child.is_dir() and name.startswith("python3") and "." in name:
+                    return name[len("python"):]
+                if name.lower().startswith("python3") and name.lower().endswith(".dll"):
+                    digits = name[len("python"):-len(".dll")]
+                    if digits.isdigit() and len(digits) >= 2:
+                        return f"{digits[0]}.{digits[1:]}"
+    except (OSError, PermissionError):
+        return None
+    return None
+
+
+def _describe_interpreter(python_exe: Path | str) -> str:
+    """Return 'path (version X)' for a limitation message."""
+    path = Path(python_exe)
+    version = _interpreter_version(path)
+    return f"{path} (Python {version})" if version else f"{path} (version unknown)"
+
+
+def _interpreter_behind_script(script_path: Path) -> Path | None:
+    """Return the interpreter a console script would run under.
+
+    Two layouts to cover, and missing the second one silently disables the
+    mismatch warning this exists to produce:
+
+    - A virtual environment puts ``python`` and ``pytest`` side by side in
+      ``Scripts/`` (Windows) or ``bin/`` (POSIX).
+    - A system install puts ``pytest.exe`` in ``Scripts/`` but ``python.exe``
+      one level up, in the installation root.
+    """
+    bin_dir = script_path.parent
+    for directory in (bin_dir, bin_dir.parent):
+        for name in ("python.exe", "python", "python3.exe", "python3"):
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _same_interpreter(left: Path | str, right: Path | str) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, ValueError):
+        return str(left) == str(right)
+
+
+#: Checks proposed because the tool is installed, not because the project asked
+#: for it. Kept distinct from "proposed" so a caller can offer them separately
+#: and a report can say the configuration is the tool's default, not the
+#: project's: running a linter under defaults it was never tuned for produces
+#: findings the project may have deliberately disabled.
+STATUS_OPTIONAL = "proposed_optional"
+
+
+def _propose_default_config_check(
+    name: str,
+    ecosystem: str,
+    tool: str,
+    argv_tail: list[str],
+    root: Path,
+    venv_info: dict | None = None,
+    use_python_module: bool = False,
+) -> dict | None:
+    """Propose an installed-but-unconfigured tool as an optional check.
+
+    Returns None when the tool is not installed, in which case there is nothing
+    to offer and the caller records a limitation instead. Skipping a tool the
+    user already has installed is a silent loss of coverage; proposing it with
+    the label makes the trade-off visible and declinable.
+    """
+    res = resolve_executable(tool, root, allow_global=False if venv_info else True)
+    if res["resolution_source"] == "not_found":
+        return None
+
+    if use_python_module and res.get("python_exe"):
+        command = [res["python_exe"], "-m", tool, *argv_tail]
+        resolved = res["python_exe"]
+    else:
+        command = [res["resolved_path"], *argv_tail]
+        resolved = res["resolved_path"]
+
+    return {
+        "name": name,
+        "ecosystem": ecosystem,
+        "command": command,
+        "reason": (
+            f"'{tool}' is installed but this project has no {tool} configuration. "
+            f"Proposed as an optional check using {tool}'s default config, which may "
+            f"report issues the project would have configured away."
+        ),
+        "resolved_executable": resolved,
+        "resolution_source": res["resolution_source"],
+        "config_source": "default config",
+        "optional": True,
+        "executed": False,
+        "status": STATUS_OPTIONAL,
+    }
 
 
 def _find_node_modules_bin(root: Path, tool_name: str) -> Path | None:
@@ -280,52 +427,64 @@ def _discover_python_checks(root: Path) -> tuple[list[dict], list[str]]:
             pass
 
     if has_pytest_config or has_test_files:
-        res = resolve_executable("pytest", root, allow_global=False if venv_info else True)
-        if res["resolution_source"] == "project_venv":
-            if res.get("python_exe"):
-                cmd = [res["python_exe"], "-m", "pytest"]
-                resolved_exe = res["python_exe"]
-                reason_str = f"{pytest_reason} (using project-local venv interpreter)"
-            else:
-                cmd = [res["resolved_path"]]
-                resolved_exe = res["resolved_path"]
-                reason_str = f"{pytest_reason} (using project-local venv)"
-            checks.append({
-                "name": "test",
-                "ecosystem": "python",
-                "command": cmd,
-                "reason": reason_str,
-                "resolved_executable": resolved_exe,
-                "resolution_source": "project_venv",
-                "executed": False,
-                "status": "proposed",
-            })
-        elif res["resolution_source"] == "system_path":
-            checks.append({
-                "name": "test",
-                "ecosystem": "python",
-                "command": ["pytest"],
-                "reason": pytest_reason or "Recognized Python test files or configuration",
-                "resolved_executable": res["resolved_path"],
-                "resolution_source": "system_path",
-                "executed": False,
-                "status": "proposed",
-            })
+        # Always invoke pytest as `<interpreter> -m pytest`. A bare `pytest`
+        # runs whichever launcher PATH happens to resolve first, which can
+        # import a different site-packages than the project's -- tests then
+        # pass or fail for reasons that have nothing to do with the code.
+        if venv_info and venv_info.get("python_exe"):
+            interpreter = str(venv_info["python_exe"].resolve())
+            resolution_source = "project_venv"
+            reason_str = f"{pytest_reason} (project-local venv interpreter, invoked as -m pytest)"
         else:
-            checks.append({
-                "name": "test",
-                "ecosystem": "python",
-                "command": ["pytest"],
-                "reason": f"{pytest_reason} (not found in project venv or PATH)",
-                "resolved_executable": None,
-                "resolution_source": "not_found",
-                "executed": False,
-                "status": "proposed",
-            })
-            if venv_info:
-                limitations.append("pytest configured or tests found, but 'pytest' is not installed in the project virtual environment.")
-            else:
-                limitations.append("pytest configured or tests found, but 'pytest' is not installed on PATH.")
+            interpreter = sys.executable
+            resolution_source = "veriflow_interpreter"
+            reason_str = (
+                f"{pytest_reason} (no project venv found; using the interpreter "
+                "running Veriflow, invoked as -m pytest)"
+            )
+
+        checks.append({
+            "name": "test",
+            "ecosystem": "python",
+            "command": [interpreter, "-m", "pytest"],
+            "reason": reason_str,
+            "resolved_executable": interpreter,
+            "resolution_source": resolution_source,
+            "executed": False,
+            "status": "proposed",
+        })
+
+        # Warn when a pytest launcher on PATH belongs to a different Python
+        # than the one that will be used, because that is the case where a
+        # user running `pytest` by hand gets different results from Veriflow.
+        path_pytest = shutil.which("pytest")
+        if path_pytest:
+            path_interpreter = _interpreter_behind_script(Path(path_pytest))
+            if path_interpreter and not _same_interpreter(path_interpreter, interpreter):
+                limitations.append(
+                    "WARNING: a 'pytest' on PATH belongs to a different Python than the "
+                    f"one Veriflow will use. Veriflow: {_describe_interpreter(interpreter)}; "
+                    f"PATH pytest: {path_pytest} -> {_describe_interpreter(path_interpreter)}. "
+                    "Running 'pytest' directly may import different packages and give a "
+                    "different result."
+                )
+
+        # Report installation state separately from command construction: the
+        # command is still correct when pytest is absent, it just cannot run,
+        # and that must surface as a limitation rather than a silent pass.
+        pytest_present = resolve_executable(
+            "pytest", root, allow_global=False if venv_info else True
+        )["resolution_source"] != "not_found"
+        if not pytest_present:
+            where = (
+                "the project virtual environment"
+                if venv_info
+                else "the interpreter running Veriflow"
+            )
+            limitations.append(
+                f"pytest configured or tests found, but 'pytest' is not installed in {where}. "
+                f"The check will report COMMAND_NOT_FOUND rather than PASS."
+            )
     else:
         limitations.append("No pytest configuration or test files discovered for Python.")
 
@@ -383,7 +542,17 @@ def _discover_python_checks(root: Path) -> tuple[list[dict], list[str]]:
             else:
                 limitations.append("Ruff configuration discovered, but 'ruff' is not installed on PATH.")
     else:
-        limitations.append("No Ruff configuration discovered for Python.")
+        optional = _propose_default_config_check(
+            "lint", "python", "ruff", ["check", "."], root, venv_info
+        )
+        if optional:
+            checks.append(optional)
+            limitations.append(
+                "No Ruff configuration discovered, but 'ruff' is installed. Proposed as an "
+                "optional 'lint' check using Ruff's default rules."
+            )
+        else:
+            limitations.append("No Ruff configuration discovered for Python, and 'ruff' is not installed.")
 
     # 3. mypy discovery
     has_mypy_config = False
@@ -449,7 +618,18 @@ def _discover_python_checks(root: Path) -> tuple[list[dict], list[str]]:
             else:
                 limitations.append("mypy configuration discovered, but 'mypy' is not installed on PATH.")
     else:
-        limitations.append("No mypy configuration discovered for Python.")
+        optional = _propose_default_config_check(
+            "typecheck", "python", "mypy", ["."], root, venv_info, use_python_module=True
+        )
+        if optional:
+            checks.append(optional)
+            limitations.append(
+                "No mypy configuration discovered, but 'mypy' is installed. Proposed as an "
+                "optional 'typecheck' check using mypy's default settings, which are "
+                "stricter than most projects configure."
+            )
+        else:
+            limitations.append("No mypy configuration discovered for Python, and 'mypy' is not installed.")
 
     return checks, limitations
 
@@ -553,6 +733,30 @@ def _discover_javascript_checks(root: Path, detection: dict) -> tuple[list[dict]
                 })
                 limitations.append("ESLint configuration discovered, but 'eslint' is not installed in node_modules/.bin or PATH.")
             seen_check_names.add("lint")
+        else:
+            global_eslint = shutil.which("eslint")
+            if global_eslint:
+                checks.append({
+                    "name": "lint",
+                    "ecosystem": "javascript",
+                    "command": ["eslint", "."],
+                    "reason": (
+                        "'eslint' is installed but this project has no ESLint configuration. "
+                        "Proposed as an optional check using ESLint's default config, which "
+                        "may report issues the project would have configured away."
+                    ),
+                    "resolved_executable": str(global_eslint),
+                    "resolution_source": "system_path",
+                    "config_source": "default config",
+                    "optional": True,
+                    "executed": False,
+                    "status": STATUS_OPTIONAL,
+                })
+                limitations.append(
+                    "No ESLint configuration discovered, but 'eslint' is installed. Proposed "
+                    "as an optional 'lint' check using ESLint's default rules."
+                )
+                seen_check_names.add("lint")
 
     # TypeScript fallback if typecheck not explicitly defined in scripts
     if "typecheck" not in seen_check_names and (root / "tsconfig.json").is_file():
@@ -595,6 +799,40 @@ def _discover_javascript_checks(root: Path, detection: dict) -> tuple[list[dict]
                 })
                 limitations.append("tsconfig.json found, but 'tsc' is not installed in node_modules/.bin or PATH.")
         seen_check_names.add("typecheck")
+
+    # tsc installed but the project has no tsconfig.json. Only worth proposing
+    # when TypeScript sources actually exist: `tsc --noEmit` with no config and
+    # no file arguments compiles nothing and would report a hollow PASS.
+    elif "typecheck" not in seen_check_names:
+        try:
+            has_ts_sources = any(root.glob("*.ts")) or any(root.glob("src/**/*.ts"))
+        except OSError:
+            has_ts_sources = False
+        if has_ts_sources:
+            tsc_path = _find_node_modules_bin(root, "tsc") or shutil.which("tsc")
+            if tsc_path:
+                checks.append({
+                    "name": "typecheck",
+                    "ecosystem": "typescript",
+                    "command": [str(tsc_path), "--noEmit", "--strict"],
+                    "reason": (
+                        "'tsc' is installed and TypeScript sources exist, but this project "
+                        "has no tsconfig.json. Proposed as an optional check using tsc's "
+                        "default compiler options, which may differ from the project's intent."
+                    ),
+                    "resolved_executable": str(tsc_path),
+                    "resolution_source": "node_modules" if _find_node_modules_bin(root, "tsc") else "system_path",
+                    "config_source": "default config",
+                    "optional": True,
+                    "executed": False,
+                    "status": STATUS_OPTIONAL,
+                })
+                limitations.append(
+                    "No tsconfig.json discovered, but 'tsc' is installed and TypeScript "
+                    "sources exist. Proposed as an optional 'typecheck' check using default "
+                    "compiler options."
+                )
+                seen_check_names.add("typecheck")
 
     if "test" not in seen_check_names:
         limitations.append("No 'test' script found in package.json.")
@@ -690,6 +928,117 @@ def _discover_dotnet_checks(root: Path, detection: dict) -> tuple[list[dict], li
             "executed": False,
             "status": "proposed",
         })
+    return checks, limitations
+
+
+def _discover_dependency_audit_checks(root: Path, detection: dict) -> tuple[list[dict], list[str]]:
+    """Offer a dependency vulnerability audit, or state what is blocking it.
+
+    Veriflow bundles no CVE data, so this delegates to the ecosystem's real
+    auditing tool. Two rules shape the result:
+
+    - **Nothing is installed automatically.** A missing tool yields a BLOCKED
+      check carrying the exact install command, never an attempt to fetch it.
+    - **It is optional, so it is not run by a bare --execute.** Both pip-audit
+      and npm audit query a remote advisory database, and Veriflow does not
+      make network calls unless asked. Request it by name to run it.
+    """
+    checks: list[dict] = []
+    limitations: list[str] = []
+    detected = detection.get("detected_types", [])
+
+    is_python = "python" in detected
+    if is_python:
+        res = resolve_executable("pip-audit", root, allow_global=True)
+        if res["resolution_source"] != "not_found":
+            checks.append({
+                "name": "dependency-audit",
+                "ecosystem": "python",
+                "command": [res["resolved_path"], "--strict"],
+                "reason": (
+                    "'pip-audit' is installed. Optional: queries the PyPI advisory "
+                    "database over the network, so it runs only when requested by name."
+                ),
+                "resolved_executable": res["resolved_path"],
+                "resolution_source": res["resolution_source"],
+                "optional": True,
+                "requires_network": True,
+                "executed": False,
+                "status": STATUS_OPTIONAL,
+            })
+        else:
+            checks.append({
+                "name": "dependency-audit",
+                "ecosystem": "python",
+                "command": ["pip-audit", "--strict"],
+                "reason": "Python project detected, but 'pip-audit' is not installed.",
+                "resolved_executable": None,
+                "resolution_source": "not_found",
+                "optional": True,
+                "requires_network": True,
+                "remediation": "pip install pip-audit",
+                "executed": False,
+                "status": "BLOCKED",
+            })
+            limitations.append(
+                "Dependency audit is BLOCKED for Python: 'pip-audit' is not installed. "
+                "Install it with 'pip install pip-audit'. Veriflow does not install it for you. "
+                "No CVE data was consulted, so dependency vulnerabilities are UNKNOWN, not absent."
+            )
+
+    # A package.json that does not parse is not a usable npm project: npm audit
+    # would fail on it too, so offering the check would promise coverage that
+    # cannot exist.
+    has_valid_package_json = False
+    package_json = root / "package.json"
+    if package_json.is_file():
+        try:
+            json.loads(package_json.read_text(encoding="utf-8"))
+            has_valid_package_json = True
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            limitations.append(
+                "package.json could not be parsed, so no dependency audit was offered "
+                "for JavaScript. Dependency vulnerabilities are UNKNOWN, not absent."
+            )
+
+    if has_valid_package_json:
+        npm_exe = shutil.which("npm")
+        if npm_exe:
+            checks.append({
+                "name": "dependency-audit-npm" if is_python else "dependency-audit",
+                "ecosystem": "javascript",
+                "command": [npm_exe, "audit"],
+                "reason": (
+                    "'npm' is installed and package.json exists. Optional: queries the npm "
+                    "advisory database over the network, so it runs only when requested by name."
+                ),
+                "resolved_executable": str(npm_exe),
+                "resolution_source": "system_path",
+                "optional": True,
+                "requires_network": True,
+                "executed": False,
+                "status": STATUS_OPTIONAL,
+            })
+        else:
+            checks.append({
+                "name": "dependency-audit-npm" if is_python else "dependency-audit",
+                "ecosystem": "javascript",
+                "command": ["npm", "audit"],
+                "reason": "package.json exists, but 'npm' is not installed.",
+                "resolved_executable": None,
+                "resolution_source": "not_found",
+                "optional": True,
+                "requires_network": True,
+                "remediation": "Install Node.js, which provides npm (https://nodejs.org)",
+                "executed": False,
+                "status": "BLOCKED",
+            })
+            limitations.append(
+                "Dependency audit is BLOCKED for JavaScript: 'npm' is not installed. "
+                "Install Node.js to get it. No CVE data was consulted, so dependency "
+                "vulnerabilities are UNKNOWN, not absent."
+            )
+
     return checks, limitations
 
 
@@ -1598,6 +1947,8 @@ def discover_checks(
     execute: bool = False,
     timeout: int = 30,
     check_name: str | None = None,
+    changed: bool = False,
+    changed_base: str | None = None,
 ) -> dict:
     """
     Discover validation checks for a project.
@@ -1605,6 +1956,8 @@ def discover_checks(
     If execute=False (default), returns preview of proposed checks without executing them.
     If execute=True, executes each discovered check safely and captures outcomes.
     If check_name is provided, filters to only that exact check name.
+    If changed=True, narrows the test check to files changed according to git,
+    falling back to a full run (with the reason recorded) when git cannot answer.
     """
     root_path = Path(root).resolve()
 
@@ -1692,8 +2045,73 @@ def discover_checks(
     all_checks.extend(security_checks)
     all_limitations.extend(security_limits)
 
+    audit_checks, audit_limits = _discover_dependency_audit_checks(root_path, detection)
+    all_checks.extend(audit_checks)
+    all_limitations.extend(audit_limits)
+
     if not all_checks and not detected_types:
         all_limitations.append("No recognizable project configuration or checks found for the directory.")
+
+    change_info: dict | None = None
+    if changed:
+        if _changed_files_mod is None:
+            change_info = {
+                "narrowed": False,
+                "fallback_reason": "the changed-files helper could not be loaded",
+                "changed_files": [],
+                "file_count": 0,
+                "base": changed_base,
+                "related_tests": [],
+            }
+            all_limitations.append(
+                "--changed was requested but the helper could not be loaded; "
+                "ran the full set of checks instead."
+            )
+        else:
+            change_set = _changed_files_mod.resolve_changed_files(root_path, changed_base)
+            related = (
+                _changed_files_mod.related_test_files(root_path, change_set.files)
+                if change_set.narrowed
+                else []
+            )
+            change_info = change_set.to_dict()
+            change_info["related_tests"] = related
+
+            if not change_set.narrowed:
+                all_limitations.append(
+                    f"--changed could not narrow the run ({change_set.fallback_reason}); "
+                    "ran the full set of checks instead."
+                )
+            elif not change_set.files:
+                all_limitations.append(
+                    "--changed found no modified source files. Checks were left at full "
+                    "scope rather than reporting a pass over nothing."
+                )
+            else:
+                # Narrow only the test check, and only when related tests were
+                # actually found. Appending nothing would run the entire suite
+                # while the report claimed a narrowed scope.
+                if related:
+                    for check in all_checks:
+                        if check["name"] == "test" and check["ecosystem"] == "python":
+                            check["command"] = [*check["command"], *related]
+                            check["reason"] = (
+                                f"{check['reason']} [--changed: limited to "
+                                f"{len(related)} related test file(s)]"
+                            )
+                            check["changed_scope"] = list(related)
+                    all_limitations.append(
+                        f"--changed limited the test run to {len(related)} test file(s) "
+                        f"related to {len(change_set.files)} changed source file(s). "
+                        "Tests that do not follow the test_<module> naming convention were "
+                        "not selected, so this is a narrowed run, not full verification."
+                    )
+                else:
+                    all_limitations.append(
+                        f"--changed found {len(change_set.files)} changed file(s) but no "
+                        "test files matching the test_<module> naming convention. The test "
+                        "check was left at full scope."
+                    )
 
     if check_name is not None:
         target_name = check_name.strip() if isinstance(check_name, str) else check_name
@@ -1712,8 +2130,26 @@ def discover_checks(
         all_checks = matching_checks
 
     if execute:
+        # An explicit --check NAME is a request to run that check, including an
+        # optional one. Without it, optional checks stay offered but unrun:
+        # several reach the network, and none were asked for by the project.
+        explicitly_requested = check_name is not None
         executed_checks = []
         for check in all_checks:
+            if check.get("status") == "BLOCKED":
+                # Cannot run and must never read as a pass. Left exactly as
+                # discovered, with its remediation intact.
+                executed_checks.append(check)
+                continue
+            if check.get("optional") and not explicitly_requested:
+                skipped = dict(check)
+                skipped["status"] = "NOT_RUN"
+                skipped["skip_reason"] = (
+                    "optional check, not requested; rerun with "
+                    f"--check {check['name']} to execute it"
+                )
+                executed_checks.append(skipped)
+                continue
             check_timeout = check.get("timeout", timeout)
             executed_check = execute_check(check, root_path, timeout=check_timeout)
             executed_checks.append(executed_check)
@@ -1725,14 +2161,18 @@ def discover_checks(
             "timed_out": sum(1 for c in executed_checks if c["status"] == "TIMEOUT"),
             "command_not_found": sum(1 for c in executed_checks if c["status"] == "COMMAND_NOT_FOUND"),
             "error": sum(1 for c in executed_checks if c["status"] == "ERROR"),
+            "blocked": sum(1 for c in executed_checks if c["status"] == "BLOCKED"),
+            "not_run": sum(1 for c in executed_checks if c["status"] == "NOT_RUN"),
         }
 
         return {
             "project_root": str(root_path),
             "detected_types": detected_types,
             "package_manager": package_manager,
+            "python_package_manager": detection.get("python_package_manager", "unknown"),
             "discovered_checks": executed_checks,
             "limitations": all_limitations,
+            "changed_scope": change_info,
             "executed": True,
             "summary": summary,
             "note": "Execution completed. Check results reflect actual process execution outcomes.",
@@ -1749,14 +2189,18 @@ def discover_checks(
             "timed_out": 0,
             "command_not_found": 0,
             "error": 0,
+            "blocked": sum(1 for c in all_checks if c.get("status") == "BLOCKED"),
+            "optional": sum(1 for c in all_checks if c.get("optional")),
         }
 
         return {
             "project_root": str(root_path),
             "detected_types": detected_types,
             "package_manager": package_manager,
+            "python_package_manager": detection.get("python_package_manager", "unknown"),
             "discovered_checks": all_checks,
             "limitations": all_limitations,
+            "changed_scope": change_info,
             "executed": False,
             "summary": summary,
             "note": "Discovery only. Proposed commands have not been executed. Discovery does not guarantee dependencies are installed or checks will pass.",
@@ -1770,6 +2214,74 @@ def run_checks(
 ) -> dict:
     """Convenience function to discover and execute checks on a project."""
     return discover_checks(root, execute=True, timeout=timeout, check_name=check_name)
+
+
+def _format_skipped_section(data: dict) -> list[str]:
+    """Render the 'Suppressed / skipped' block.
+
+    Always rendered. An absent section reads as "nothing was hidden" whether or
+    not that is true, so the block states explicitly when it has nothing to
+    report rather than disappearing.
+    """
+    lines = ["Suppressed / skipped:"]
+    anything = False
+    checks = data.get("discovered_checks", [])
+
+    blocked = [c for c in checks if c.get("status") == "BLOCKED"]
+    if blocked:
+        anything = True
+        for check in blocked:
+            remediation = check.get("remediation") or "no remediation recorded"
+            lines.append(f"  - [BLOCKED] {check['name']} ({check['ecosystem']}): {remediation}")
+
+    not_run = [c for c in checks if c.get("status") == "NOT_RUN"]
+    if not_run:
+        anything = True
+        for check in not_run:
+            reason = check.get("skip_reason") or "not run"
+            lines.append(f"  - [NOT_RUN] {check['name']} ({check['ecosystem']}): {reason}")
+
+    if not data.get("executed"):
+        optional = [
+            c for c in checks if c.get("optional") and c.get("status") != "BLOCKED"
+        ]
+        if optional:
+            anything = True
+            for check in optional:
+                label = check.get("config_source") or "optional"
+                lines.append(
+                    f"  - [OPTIONAL] {check['name']} ({check['ecosystem']}): offered using "
+                    f"{label}; run it with --check {check['name']}"
+                )
+
+    missing = [c for c in checks if c.get("resolution_source") == "not_found"
+               and c.get("status") not in ("BLOCKED", "NOT_RUN")]
+    if missing:
+        anything = True
+        for check in missing:
+            lines.append(
+                f"  - [TOOL MISSING] {check['name']} ({check['ecosystem']}): "
+                f"{' '.join(str(p) for p in check['command'])} could not be resolved"
+            )
+
+    scope = data.get("changed_scope")
+    if scope:
+        anything = True
+        if scope.get("narrowed"):
+            lines.append(
+                f"  - [SCOPE] --changed limited this run to {scope.get('file_count', 0)} "
+                f"changed file(s) and {len(scope.get('related_tests') or [])} related test "
+                "file(s). Unrelated code was not verified."
+            )
+        else:
+            lines.append(
+                f"  - [SCOPE] --changed could not narrow the run "
+                f"({scope.get('fallback_reason')}); everything was run instead."
+            )
+
+    if not anything:
+        lines.append("  Nothing was skipped, blocked or left unrun.")
+    return lines
 
 
 def format_summary(data: dict) -> str:
@@ -1860,7 +2372,17 @@ def format_summary(data: dict) -> str:
             f"Missing Commands: {summary.get('command_not_found', 0)} | "
             f"Errors: {summary.get('error', 0)}"
         )
+        # Blocked and not-run counts belong on the headline, not only in the
+        # skipped section: a reader scanning "Passed: 0 | Failed: 2" out of a
+        # total of 3 would otherwise have to work out where the third went.
+        lines.append(
+            f"  Blocked: {summary.get('blocked', 0)} | "
+            f"Not Run: {summary.get('not_run', 0)}"
+        )
         lines.append("")
+
+    lines.extend(_format_skipped_section(data))
+    lines.append("")
 
     if data.get("limitations"):
         lines.append("Limitations:")
@@ -1877,7 +2399,7 @@ def format_summary(data: dict) -> str:
 
 def main():
     if "-h" in sys.argv or "--help" in sys.argv:
-        print("Usage: run-checks.py [PROJECT_DIRECTORY] [--json] [--execute] [--timeout SECONDS] [--check NAME]")
+        print("Usage: run-checks.py [PROJECT_DIRECTORY] [--json] [--execute] [--timeout SECONDS] [--check NAME] [--changed [BASE]]")
         print("")
         print("Discovers and optionally executes validation commands from project configuration.")
         print("")
@@ -1886,12 +2408,18 @@ def main():
         print("  --execute          Opt-in to execute discovered checks (default is discovery preview)")
         print("  --timeout SECONDS  Timeout in seconds for each command execution (default: 30)")
         print("  --check NAME       Filter to preview or execute only the specified check name")
+        print("  --changed [BASE]   Limit tests to files changed according to git. With BASE,")
+        print("                     compares against that revision; without it, uses staged,")
+        print("                     unstaged and untracked changes. Falls back to a full run,")
+        print("                     with the reason stated, when git cannot answer.")
         print("  --json             Output results as formatted JSON")
         print("  -h, --help         Show this help message and exit")
         sys.exit(0)
 
     as_json = "--json" in sys.argv
     do_execute = "--execute" in sys.argv
+    use_changed = False
+    changed_base = None
 
     timeout = 30
     check_filter = None
@@ -1932,6 +2460,24 @@ def main():
             check_filter = arg.split("=", 1)[1]
             i += 1
             continue
+        if arg == "--changed":
+            use_changed = True
+            # BASE is optional, so only consume the next argument when it is
+            # not another flag and not the project directory. A bare --changed
+            # at the end of the line is valid.
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                candidate = sys.argv[i + 1]
+                if not Path(candidate).is_dir():
+                    changed_base = candidate
+                    i += 2
+                    continue
+            i += 1
+            continue
+        if arg.startswith("--changed="):
+            use_changed = True
+            changed_base = arg.split("=", 1)[1] or None
+            i += 1
+            continue
         filtered_args.append(arg)
         i += 1
 
@@ -1947,6 +2493,8 @@ def main():
             execute=do_execute,
             timeout=timeout,
             check_name=check_filter,
+            changed=use_changed,
+            changed_base=changed_base,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
