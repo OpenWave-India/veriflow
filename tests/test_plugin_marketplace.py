@@ -3,10 +3,14 @@ Tests for the Claude Code plugin marketplace manifest.
 
 .claude-plugin/marketplace.json is what makes `claude plugin marketplace add
 <owner>/veriflow` followed by `claude plugin install veriflow@veriflow` work
-with zero file-copying: the plugin entry's `skills` field points straight at
-the existing `skills/veriflow` source directory. These tests exist because a
-typo or a moved file here breaks that one-command install silently -- Claude
-Code's own validation only happens when someone actually runs the command.
+with zero file-copying: this repo is both the marketplace and the single plugin
+it offers, so the entry's source is "./" and Claude Code scans `skills/` at the
+plugin root automatically.
+
+These tests exist because a typo here breaks that one-command install silently
+-- Claude Code validates only when someone actually runs the command, and the
+failure it reports ("Plugin couldn't be installed. Try again.") names no cause.
+Keep the entry minimal; every field added here has to earn its place.
 """
 
 from __future__ import annotations
@@ -57,16 +61,26 @@ class TestMarketplaceManifest(unittest.TestCase):
         """source must be "./" — the repo IS the plugin, same as other single-plugin repos."""
         self.assertEqual(self.manifest["plugins"][0]["source"], "./")
 
-    def test_plugin_has_strict_false(self):
-        """strict:false is required because the plugin layout doesn't match strict expectations.
-        Without it, Claude Code refuses to install even when the manifest and plugin.json are valid."""
-        self.assertIs(self.manifest["plugins"][0].get("strict"), False)
+    def test_plugin_entry_declares_no_component_paths(self):
+        """Component paths (skills/commands/agents/hooks) must start with "./" or Claude Code
+        rejects the plugin at install time with "Plugin couldn't be installed".
 
-    def test_plugin_skills_field_points_at_skill_directory(self):
-        """skills field must explicitly list the skill path — Claude Code does not reliably
-        auto-discover skills/ from the repo root without it."""
-        skills = self.manifest["plugins"][0].get("skills", [])
-        self.assertIn("skills/veriflow", skills)
+        Declaring them at all is unnecessary here: skills/ at the plugin root is scanned
+        automatically. A bare "skills/veriflow" shipped briefly and broke every install.
+        """
+        plugin = self.manifest["plugins"][0]
+        for field in ("skills", "commands", "agents", "hooks"):
+            for path in plugin.get(field, []):
+                with self.subTest(field=field, path=path):
+                    self.assertTrue(
+                        path.startswith("./"),
+                        f"{field} path {path!r} must start with './'",
+                    )
+
+    def test_version_is_declared_only_in_plugin_json(self):
+        """When both files set version, plugin.json wins and validation warns on a mismatch.
+        Keeping it in one place removes the chance of drift."""
+        self.assertNotIn("version", self.manifest["plugins"][0])
 
     def test_plugin_json_exists_alongside_marketplace_json(self):
         """plugin.json is required by strict mode (the default).
