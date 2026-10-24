@@ -5,6 +5,38 @@ import json
 import sys
 
 
+def detect_python_package_manager(root: Path) -> str:
+    """Identify the Python package manager from its lockfile, else pip.
+
+    A lockfile is the only reliable signal: pyproject.toml alone says nothing,
+    since uv, poetry, pdm and plain pip all read it. Reported separately from
+    the JavaScript ``package_manager`` field because that value is interpolated
+    into npm-style commands -- putting "uv" there would build `uv run test`.
+
+    Returns "unknown" when nothing identifies the project as Python at all, so
+    a caller can tell "no Python here" from "Python, manager unidentified".
+    """
+    for name, marker in (
+        ("uv", "uv.lock"),
+        ("poetry", "poetry.lock"),
+        ("pdm", "pdm.lock"),
+        ("pipenv", "Pipfile.lock"),
+    ):
+        if (root / marker).is_file():
+            return name
+
+    if (root / "pyproject.toml").is_file():
+        return "pip"
+    try:
+        if any(root.glob("requirements*.txt")):
+            return "pip"
+    except OSError:
+        pass
+    if (root / "setup.py").is_file() or (root / "setup.cfg").is_file():
+        return "pip"
+    return "unknown"
+
+
 def detect_project(root: Path | str) -> dict:
     """Detect common project types from their configuration files."""
 
@@ -89,6 +121,7 @@ def detect_project(root: Path | str) -> dict:
         "project_root": str(root.resolve()),
         "detected_types": detected,
         "package_manager": package_manager,
+        "python_package_manager": detect_python_package_manager(root),
         "available_scripts": scripts,
     }
 
