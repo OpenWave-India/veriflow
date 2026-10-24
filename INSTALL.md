@@ -229,31 +229,13 @@ python -m pytest tests -q
 
 ## Troubleshooting
 
-### `/plugin install` fails, or says "source type your Claude Code version does not support"
+### `/plugin install` fails with "Plugin couldn't be installed"
 
-Fixed as of the current `marketplace.json`. The plugin's `source` previously
-used the `"./"` relative-path shorthand, which several Claude Code versions
-normalize into a remote source object the installer can't handle for a
-plugin living in its own marketplace repo -- the install fails even though
-the marketplace itself was added successfully. The manifest now uses the
-explicit form instead:
-
-```json
-"source": { "source": "github", "repo": "OpenWave-India/veriflow" }
-```
-
-If you still hit an install error after `/plugin marketplace add
-OpenWave-India/veriflow`:
-
-1. Re-run `/plugin marketplace update OpenWave-India` (or `claude plugin
-   marketplace update OpenWave-India` from a shell) to pull the fixed
+1. Re-run `/plugin marketplace update OpenWave-India` to pull the latest
    manifest, then retry `/plugin install veriflow@veriflow`.
-2. If it still fails, open `/plugin` → **Errors** tab for the exact message,
-   or check `claude --version` against the [troubleshooting
-   guide](https://code.claude.com/docs/en/plugins/troubleshooting) for your
-   version.
+2. If it still fails, open `/plugin` → **Errors** tab for the exact message.
 3. The [manual install](#codex-or-a-manual-claude-code-install) below always
-   works regardless of plugin-system quirks, as a fallback.
+   works as a fallback.
 
 ### The agent does not list the skill
 

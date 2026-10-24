@@ -1,0 +1,11 @@
+{
+  "name": "veriflow",
+  "version": "1.0.0",
+  "description": "Verify AI-generated code changes: discovers a project's real checks, runs a 26-rule static security scanner plus opt-in live checks, catches hallucinated dependencies, diagnoses failures from captured evidence, and reports exactly what passed, failed, or was never run.",
+  "author": {
+    "name": "OpenWave-India",
+    "url": "https://github.com/OpenWave-India"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/OpenWave-India/veriflow"
+}

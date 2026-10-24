@@ -53,61 +53,26 @@ class TestMarketplaceManifest(unittest.TestCase):
         """Determines the install command: `claude plugin install veriflow@veriflow`."""
         self.assertEqual(self.manifest["plugins"][0]["name"], "veriflow")
 
-    def test_plugin_source_is_an_explicit_github_reference(self):
-        """Must be the explicit {source: github, repo: owner/repo} object form,
-        not the "./" relative-path shorthand.
+    def test_plugin_source_is_relative_self_reference(self):
+        """source must be "./" — the repo IS the plugin, same as other single-plugin repos."""
+        self.assertEqual(self.manifest["plugins"][0]["source"], "./")
 
-        A relative local-path source for a plugin that lives in the same repo
-        as its own marketplace is a known fragile pattern: several reported
-        Claude Code installs fail with "source type your Claude Code version
-        does not support" because the relative source gets normalized into a
-        remote source object some installer versions mishandle. The explicit
-        github form sidesteps that normalization step entirely.
-        """
-        source = self.manifest["plugins"][0]["source"]
-        self.assertIsInstance(source, dict, "source must be the explicit object form, not a relative path string")
-        self.assertEqual(source.get("source"), "github")
-        self.assertEqual(source.get("repo"), "OpenWave-India/veriflow")
+    def test_plugin_json_exists_alongside_marketplace_json(self):
+        """plugin.json is required by strict mode (the default).
+        Without it, Claude Code can't install the plugin even if the marketplace loads."""
+        plugin_json = REPO_ROOT / ".claude-plugin" / "plugin.json"
+        self.assertTrue(plugin_json.is_file(), ".claude-plugin/plugin.json is missing")
 
-    def test_plugin_source_is_not_a_relative_path(self):
-        """Regression guard: never go back to the "./" shorthand that broke installs."""
-        source = self.manifest["plugins"][0]["source"]
-        if isinstance(source, str):
-            self.assertFalse(source.startswith("."), "relative-path source is the known-broken form")
+    def test_skills_directory_exists_at_repo_root(self):
+        """Claude Code auto-discovers skills/ at the plugin root (the repo root for source "./")."""
+        skills_dir = REPO_ROOT / "skills" / "veriflow"
+        self.assertTrue(skills_dir.is_dir())
+        self.assertTrue((skills_dir / "SKILL.md").is_file())
 
-    def test_plugin_declares_the_skills_path(self):
-        plugin = self.manifest["plugins"][0]
-        self.assertIn("skills", plugin)
-        self.assertIsInstance(plugin["skills"], list)
-        self.assertGreater(len(plugin["skills"]), 0)
-
-    def test_declared_skills_paths_resolve_to_real_directories(self):
-        """The one thing that silently breaks the one-command install if wrong."""
-        plugin = self.manifest["plugins"][0]
-        for relative in plugin["skills"]:
-            with self.subTest(path=relative):
-                target = REPO_ROOT / relative
-                self.assertTrue(target.is_dir(), f"{relative} does not exist")
-                self.assertTrue(
-                    (target / "SKILL.md").is_file(),
-                    f"{relative} has no SKILL.md -- not a valid skill directory",
-                )
-
-    def test_strict_is_false_so_no_separate_plugin_manifest_is_required(self):
-        """strict defaults to True, which would require its own
-        .claude-plugin/plugin.json inside the source folder. We rely on the
-        marketplace entry's own declared `skills` path instead, so this must
-        stay False -- flipping it without adding that manifest breaks install."""
-        self.assertFalse(self.manifest["plugins"][0]["strict"])
-
-    def test_license_matches_the_repository_license_file(self):
-        self.assertEqual(self.manifest["plugins"][0]["license"], "MIT")
-        self.assertTrue((REPO_ROOT / "LICENSE").is_file())
-
-    def test_repository_and_homepage_urls_point_at_the_real_repo(self):
-        plugin = self.manifest["plugins"][0]
-        self.assertIn("github.com/OpenWave-India/veriflow", plugin["repository"])
-        self.assertIn("github.com/OpenWave-India/veriflow", plugin["homepage"])
+    def test_plugin_json_name_matches_marketplace_entry(self):
+        import json
+        plugin_json = json.loads((REPO_ROOT / ".claude-plugin" / "plugin.json").read_text())
+        self.assertEqual(plugin_json["name"], self.manifest["plugins"][0]["name"])
 
     def test_plugin_description_states_what_and_when(self):
         """Claude Code matches a user's request against this description to

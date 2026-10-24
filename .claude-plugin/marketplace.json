@@ -1,33 +1,18 @@
 {
   "$schema": "https://www.schemastore.org/claude-code-marketplace.json",
   "name": "veriflow",
+  "description": "AI coding verification toolkit — static security scanner, dependency identity check, bounded repair, honest reporting.",
   "owner": {
     "name": "OpenWave-India",
     "url": "https://github.com/OpenWave-India"
   },
-  "metadata": {
-    "description": "Veriflow verifies AI-generated code changes honestly: discovers a project's real checks, runs a 26-rule static security scanner plus opt-in live checks, catches hallucinated dependencies, diagnoses failures from captured evidence, and reports exactly what passed, failed, or was never run."
-  },
   "plugins": [
     {
       "name": "veriflow",
-      "source": {
-        "source": "github",
-        "repo": "OpenWave-India/veriflow"
-      },
+      "source": "./",
       "description": "Verify code changes by discovering the project's real checks, previewing them, executing only the relevant ones, scanning for security defects (secrets, injection, hallucinated dependencies), diagnosing failures from captured evidence, applying bounded minimal repairs, and reporting honestly what passed, failed, was skipped or remains unknown. Use when implementing a feature, fixing a bug, modifying existing code, reviewing a diff, investigating a failing test or build, or preparing a project for release.",
       "version": "1.0.0",
-      "author": {
-        "name": "OpenWave-India",
-        "url": "https://github.com/OpenWave-India"
-      },
-      "license": "MIT",
-      "homepage": "https://github.com/OpenWave-India/veriflow",
-      "repository": "https://github.com/OpenWave-India/veriflow",
-      "category": "development",
-      "keywords": ["verification", "testing", "security-scanner", "code-review", "dependency-check"],
-      "strict": false,
-      "skills": ["skills/veriflow"]
+      "category": "development"
     }
   ]
 }
