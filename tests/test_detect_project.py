@@ -138,5 +138,69 @@ class TestDetectProject(unittest.TestCase):
         self.assertIn("Usage: detect-project.py", proc.stdout)
 
 
+class TestPythonPackageManager(unittest.TestCase):
+    """Python's manager is reported in its own field.
+
+    Deliberately NOT folded into `package_manager`: run-checks.py interpolates
+    that value into npm-style commands, so "uv" landing there would produce
+    `uv run test` for a JavaScript check.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.root = Path(self.test_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_lockfiles_identify_the_manager(self):
+        for marker, expected in (
+            ("uv.lock", "uv"),
+            ("poetry.lock", "poetry"),
+            ("pdm.lock", "pdm"),
+            ("Pipfile.lock", "pipenv"),
+        ):
+            with self.subTest(marker=marker):
+                for stale in ("uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock"):
+                    (self.root / stale).unlink(missing_ok=True)
+                (self.root / marker).write_text("", encoding="utf-8")
+                self.assertEqual(
+                    detect_project(self.root)["python_package_manager"], expected
+                )
+
+    def test_pyproject_without_a_lockfile_is_pip(self):
+        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+        self.assertEqual(detect_project(self.root)["python_package_manager"], "pip")
+
+    def test_requirements_variants_are_pip(self):
+        for name in ("requirements.txt", "requirements-dev.txt"):
+            with self.subTest(name=name):
+                for stale in self.root.glob("requirements*.txt"):
+                    stale.unlink()
+                (self.root / name).write_text("pytest\n", encoding="utf-8")
+                self.assertEqual(
+                    detect_project(self.root)["python_package_manager"], "pip"
+                )
+
+    def test_a_lockfile_outranks_pyproject(self):
+        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+        (self.root / "uv.lock").write_text("", encoding="utf-8")
+        self.assertEqual(detect_project(self.root)["python_package_manager"], "uv")
+
+    def test_non_python_project_reports_unknown(self):
+        """"unknown" must mean "not Python", distinct from "Python, unidentified"."""
+        (self.root / "package.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(detect_project(self.root)["python_package_manager"], "unknown")
+
+    def test_javascript_package_manager_field_is_untouched(self):
+        """The regression this separation exists to prevent."""
+        (self.root / "package.json").write_text("{}", encoding="utf-8")
+        (self.root / "yarn.lock").write_text("", encoding="utf-8")
+        (self.root / "uv.lock").write_text("", encoding="utf-8")
+        result = detect_project(self.root)
+        self.assertEqual(result["package_manager"], "yarn")
+        self.assertEqual(result["python_package_manager"], "uv")
+
+
 if __name__ == "__main__":
     unittest.main()
